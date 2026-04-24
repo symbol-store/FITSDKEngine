@@ -11,6 +11,7 @@
 #include <fstream>
 #include <map>
 #include <string>
+#include <unordered_map>
 
 using std::string_literals::operator""s;
 using boss::utilities::operator""_;
@@ -28,7 +29,7 @@ static Expression evaluate(Expression&& e) {
          [](auto, auto dynamics, auto) -> Expression {
            auto const& path = std::get<std::string>(dynamics.at(0));
            auto const& msgType = std::get<Symbol>(dynamics.at(1)).getName();
-           std::fstream file(path, std::ios::in | std::ios::binary);
+           auto file = std::fstream(path, std::ios::in | std::ios::binary);
            if(!file.is_open()) return "LoadFIT::error: cannot open file: "s + path;
 
            struct : fit::MesgListener {
@@ -36,7 +37,7 @@ static Expression evaluate(Expression&& e) {
              void OnMesg(fit::Mesg& mesg) override {
                auto& columns = tables[mesg.GetName()];
                for(FIT_UINT16 i = 0; i < (FIT_UINT16)mesg.GetNumFields(); i++) {
-                 fit::Field* field = mesg.GetFieldByIndex(i);
+                 auto* field = mesg.GetFieldByIndex(i);
                  if(!field || !field->IsValid() || !field->IsValueValid()) continue;
                  switch(field->GetType()) {
                  case FIT_BASE_TYPE_STRING: {
@@ -56,9 +57,8 @@ static Expression evaluate(Expression&& e) {
              }
            } listener;
 
-           fit::Decode decode;
            try {
-             decode.Read(file, listener);
+             fit::Decode().Read(file, listener);
            } catch(fit::RuntimeException const& e) {
              return "LoadFIT::error: "s + e.what();
            } catch(...) {
@@ -69,7 +69,7 @@ static Expression evaluate(Expression&& e) {
            if(it == listener.tables.end())
              return "LoadFIT::error: message type not found: "s + msgType;
 
-           ExpressionArguments columns;
+           auto columns = ExpressionArguments{};
            for(auto& [name, values] : it->second)
              columns.emplace_back(ComplexExpression(Symbol(name), {}, std::move(values), {}));
 
