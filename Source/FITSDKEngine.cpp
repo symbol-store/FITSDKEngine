@@ -8,10 +8,12 @@
 #include "fit_mesg.hpp"
 #include "fit_runtime_exception.hpp"
 
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 using std::string_literals::operator""s;
 using boss::utilities::operator""_;
@@ -29,8 +31,16 @@ static Expression evaluate(Expression&& e) {
          [](auto, auto dynamics, auto) -> Expression {
            auto const& path = std::get<std::string>(dynamics.at(0));
            auto const& msgType = std::get<Symbol>(dynamics.at(1)).getName();
-           auto file = std::fstream(path, std::ios::in | std::ios::binary);
-           if(!file.is_open()) return "LoadFIT::error: cannot open file: "s + path;
+
+           auto filePaths = std::vector<std::filesystem::path>{};
+           if(std::filesystem::is_directory(path)) {
+             for(auto const& entry : std::filesystem::directory_iterator(path))
+               if(entry.path().extension() == ".fit")
+                 filePaths.push_back(entry.path());
+             std::sort(filePaths.begin(), filePaths.end());
+           } else {
+             filePaths.push_back(path);
+           }
 
            struct : fit::MesgListener {
              std::unordered_map<std::string, std::map<std::string, ExpressionArguments>> tables;
@@ -57,12 +67,17 @@ static Expression evaluate(Expression&& e) {
              }
            } listener;
 
-           try {
-             fit::Decode().Read(file, listener);
-           } catch(fit::RuntimeException const& e) {
-             return "LoadFIT::error: "s + e.what();
-           } catch(...) {
-             return "LoadFIT::error: unknown exception during decode"s;
+           for(auto const& filePath : filePaths) {
+             auto file = std::fstream(filePath, std::ios::in | std::ios::binary);
+             if(!file.is_open())
+               return "LoadFIT::error: cannot open file: "s + filePath.string();
+             try {
+               fit::Decode().Read(file, listener);
+             } catch(fit::RuntimeException const& e) {
+               return "LoadFIT::error: "s + e.what();
+             } catch(...) {
+               return "LoadFIT::error: unknown exception during decode"s;
+             }
            }
 
            auto it = listener.tables.find(msgType);
