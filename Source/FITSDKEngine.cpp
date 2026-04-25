@@ -13,6 +13,7 @@
 #include <map>
 #include <string>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 using std::string_literals::operator""s;
@@ -21,6 +22,8 @@ using boss::ComplexExpression;
 using boss::Symbol;
 using boss::Expression;
 using boss::ExpressionArguments;
+using boss::expressions::ExpressionSpanArguments;
+using boss::Span;
 using namespace boss::utilities::experimental;
 
 static Expression evaluate(Expression&& e) {
@@ -43,7 +46,7 @@ static Expression evaluate(Expression&& e) {
            }
 
            struct : fit::MesgListener {
-             std::unordered_map<std::string, std::map<std::string, ExpressionArguments>> tables;
+             std::unordered_map<std::string, std::map<std::string, std::variant<std::vector<double>, std::vector<std::string>>>> tables;
              void OnMesg(fit::Mesg& mesg) override {
                auto& columns = tables[mesg.GetName()];
                for(FIT_UINT16 i = 0; i < (FIT_UINT16)mesg.GetNumFields(); i++) {
@@ -51,8 +54,10 @@ static Expression evaluate(Expression&& e) {
                  if(!field || !field->IsValid() || !field->IsValueValid()) continue;
                  switch(field->GetType()) {
                  case FIT_BASE_TYPE_STRING: {
+                   auto& column = columns[field->GetName()];
+                   if(std::holds_alternative<std::vector<double>>(column)) column = std::vector<std::string>{};
                    auto const& wstr = field->GetSTRINGValue();
-                   columns[field->GetName()].emplace_back(std::string(wstr.begin(), wstr.end()));
+                   std::get<std::vector<std::string>>(column).emplace_back(wstr.begin(), wstr.end());
                    break;
                  }
                  case FIT_BASE_TYPE_ENDIAN_FLAG:
@@ -61,7 +66,8 @@ static Expression evaluate(Expression&& e) {
                    break;
                  default:
                    // GetFLOAT64Value applies scale and offset as defined by the FIT profile
-                   columns[field->GetName()].emplace_back(field->GetFLOAT64Value());
+                   std::get<std::vector<double>>(columns[field->GetName()]).emplace_back(
+                       field->GetFLOAT64Value());
                  }
                }
              }
@@ -80,13 +86,20 @@ static Expression evaluate(Expression&& e) {
              }
            }
 
-           auto it = listener.tables.find(msgType);
-           if(it == listener.tables.end())
+           auto tableEntry = listener.tables.find(msgType);
+           if(tableEntry == listener.tables.end())
              return "LoadFIT::error: message type not found: "s + msgType;
 
            auto columns = ExpressionArguments{};
-           for(auto& [name, values] : it->second)
-             columns.emplace_back(ComplexExpression(Symbol(name), {}, std::move(values), {}));
+           for(auto& [name, column] : tableEntry->second)
+             columns.emplace_back(std::visit(
+                 [&name](auto& values) -> Expression {
+                   return ComplexExpression(
+                       Symbol(name), {}, {},
+                       ExpressionSpanArguments(
+                           Span<typename std::decay_t<decltype(values)>::value_type>(std::move(values))));
+                 },
+                 column));
 
            return ComplexExpression(Symbol("Table"), {}, std::move(columns), {});
          };
