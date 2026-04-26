@@ -26,6 +26,45 @@ using boss::Symbol;
 using boss::expressions::ExpressionSpanArguments;
 using namespace boss::utilities::experimental;
 
+namespace {
+
+struct ColumnBuilder {
+  ExpressionSpanArguments spans;
+  std::variant<std::vector<double>, std::vector<std::string>, std::vector<Symbol>> buffer;
+  size_t committedRows = 0;
+
+  void flush() {
+    std::visit(
+        [this](auto& vec) {
+          if(!vec.empty())
+            spans.push_back(Span<typename std::decay_t<decltype(vec)>::value_type>(std::move(vec)));
+        },
+        buffer);
+  }
+
+  template <typename V> void add(V&& value) {
+    using VecType = std::vector<std::decay_t<V>>;
+    if(!std::holds_alternative<VecType>(buffer)) {
+      flush();
+      buffer = VecType {};
+    }
+    std::get<VecType>(buffer).push_back(std::forward<V>(value));
+    committedRows++;
+  }
+
+  ExpressionSpanArguments build() && {
+    flush();
+    return std::move(spans);
+  }
+};
+
+struct MessageTable {
+  size_t rowCount = 0;
+  std::map<std::string, ColumnBuilder> columns;
+};
+
+} // namespace
+
 static Expression evaluate(Expression&& e) {
   using sentinel::Any_;
   using sentinel::Symbol_;
@@ -40,30 +79,26 @@ static Expression evaluate(Expression&& e) {
              for(auto const& entry : std::filesystem::directory_iterator(path))
                if(entry.path().extension() == ".fit")
                  filePaths.push_back(entry.path());
-             std::sort(filePaths.begin(), filePaths.end());
+             std::ranges::sort(filePaths);
            } else {
              filePaths.push_back(path);
            }
 
            struct : fit::MesgListener {
-             std::unordered_map<
-                 std::string,
-                 std::map<std::string, std::variant<std::vector<double>, std::vector<std::string>>>>
-                 tables;
+             std::unordered_map<std::string, MessageTable> tables;
              void OnMesg(fit::Mesg& mesg) override {
-               auto& columns = tables[mesg.GetName()];
+               auto& table = tables[mesg.GetName()];
                for(FIT_UINT16 i = 0; i < (FIT_UINT16)mesg.GetNumFields(); i++) {
                  auto* field = mesg.GetFieldByIndex(i);
                  if(!field || !field->IsValid() || !field->IsValueValid())
                    continue;
+                 auto& column = table.columns[field->GetName()];
+                 while(column.committedRows < table.rowCount)
+                   column.add(Symbol("NULL"));
                  switch(field->GetType()) {
                  case FIT_BASE_TYPE_STRING: {
-                   auto& column = columns[field->GetName()];
-                   if(std::holds_alternative<std::vector<double>>(column))
-                     column = std::vector<std::string> {};
                    auto const& wstr = field->GetSTRINGValue();
-                   std::get<std::vector<std::string>>(column).emplace_back(wstr.begin(),
-                                                                           wstr.end());
+                   column.add(std::string(wstr.begin(), wstr.end()));
                    break;
                  }
                  case FIT_BASE_TYPE_ENDIAN_FLAG:
@@ -72,10 +107,13 @@ static Expression evaluate(Expression&& e) {
                    break;
                  default:
                    // GetFLOAT64Value applies scale and offset as defined by the FIT profile
-                   std::get<std::vector<double>>(columns[field->GetName()])
-                       .emplace_back(field->GetFLOAT64Value());
+                   column.add(field->GetFLOAT64Value());
                  }
                }
+               table.rowCount++;
+               for(auto& [_, column] : table.columns)
+                 if(column.committedRows < table.rowCount)
+                   column.add(Symbol("NULL"));
              }
            } listener;
 
@@ -97,16 +135,9 @@ static Expression evaluate(Expression&& e) {
              return "LoadFIT::error: message type not found: "s + msgType;
 
            auto columns = ExpressionArguments {};
-           for(auto& [name, column] : tableEntry->second)
-             columns.emplace_back(std::visit(
-                 [&name](auto& values) -> Expression {
-                   return ComplexExpression(
-                       Symbol(name), {}, {},
-                       ExpressionSpanArguments(
-                           Span<typename std::decay_t<decltype(values)>::value_type>(
-                               std::move(values))));
-                 },
-                 column));
+           for(auto& [name, column] : tableEntry->second.columns)
+             columns.emplace_back(
+                 ComplexExpression(Symbol(name), {}, {}, std::move(column).build()));
 
            return ComplexExpression(Symbol("Table"), {}, std::move(columns), {});
          } < Any_ >= Recurse(evaluate);
