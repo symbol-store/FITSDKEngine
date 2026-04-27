@@ -85,8 +85,11 @@ static Expression evaluate(Expression&& e) {
            }
 
            struct : fit::MesgListener {
+             std::string_view targetType;
              std::unordered_map<std::string, MessageTable> tables;
              void OnMesg(fit::Mesg& mesg) override {
+               if(mesg.GetName() != targetType)
+                 return;
                auto& table = tables[mesg.GetName()];
                for(FIT_UINT16 i = 0; i < (FIT_UINT16)mesg.GetNumFields(); i++) {
                  auto* field = mesg.GetFieldByIndex(i);
@@ -116,6 +119,7 @@ static Expression evaluate(Expression&& e) {
                    column.add(Symbol("NULL"));
              }
            } listener;
+           listener.targetType = msgType;
 
            for(auto const& filePath : filePaths) {
              auto file = std::fstream(filePath, std::ios::in | std::ios::binary);
