@@ -31,7 +31,7 @@ set(CMAKE_BUILD_TYPE "${CMAKE_BUILD_TYPE}" CACHE STRING
 ############################### External Projects ###############################
 
 include(ExternalProject)
-set(BOSS_SOURCE_BRANCH nested-pattern-matching CACHE STRING "if boss core is built from source, which branch should be fetched")
+set(BOSS_SOURCE_BRANCH main CACHE STRING "if boss core is built from source, which branch should be fetched")
 set(BOSS_SOURCE_REPOSITORY https://github.com/symbol-store/BOSS.git CACHE STRING "url for the boss repository")
 ExternalProject_Add(BOSS
   GIT_REPOSITORY ${BOSS_SOURCE_REPOSITORY}
