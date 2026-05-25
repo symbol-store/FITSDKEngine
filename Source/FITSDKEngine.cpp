@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <string>
 #include <sys/mman.h>
@@ -41,174 +42,93 @@ static_assert(FIT_SPORT_COUNT == 82, "FIT SDK added new sport values — update 
 
 static Symbol fitSportName(int sport) {
   switch(sport) {
-  case FIT_SPORT_GENERIC:
-    return Symbol("Generic");
-  case FIT_SPORT_RUNNING:
-    return Symbol("Running");
-  case FIT_SPORT_CYCLING:
-    return Symbol("Cycling");
-  case FIT_SPORT_TRANSITION:
-    return Symbol("Transition");
-  case FIT_SPORT_FITNESS_EQUIPMENT:
-    return Symbol("FitnessEquipment");
-  case FIT_SPORT_SWIMMING:
-    return Symbol("Swimming");
-  case FIT_SPORT_BASKETBALL:
-    return Symbol("Basketball");
-  case FIT_SPORT_SOCCER:
-    return Symbol("Soccer");
-  case FIT_SPORT_TENNIS:
-    return Symbol("Tennis");
-  case FIT_SPORT_AMERICAN_FOOTBALL:
-    return Symbol("AmericanFootball");
-  case FIT_SPORT_TRAINING:
-    return Symbol("Training");
-  case FIT_SPORT_WALKING:
-    return Symbol("Walking");
-  case FIT_SPORT_CROSS_COUNTRY_SKIING:
-    return Symbol("CrossCountrySkiing");
-  case FIT_SPORT_ALPINE_SKIING:
-    return Symbol("AlpineSkiing");
-  case FIT_SPORT_SNOWBOARDING:
-    return Symbol("Snowboarding");
-  case FIT_SPORT_ROWING:
-    return Symbol("Rowing");
-  case FIT_SPORT_MOUNTAINEERING:
-    return Symbol("Mountaineering");
-  case FIT_SPORT_HIKING:
-    return Symbol("Hiking");
-  case FIT_SPORT_MULTISPORT:
-    return Symbol("Multisport");
-  case FIT_SPORT_PADDLING:
-    return Symbol("Paddling");
-  case FIT_SPORT_FLYING:
-    return Symbol("Flying");
-  case FIT_SPORT_E_BIKING:
-    return Symbol("EBiking");
-  case FIT_SPORT_MOTORCYCLING:
-    return Symbol("Motorcycling");
-  case FIT_SPORT_BOATING:
-    return Symbol("Boating");
-  case FIT_SPORT_DRIVING:
-    return Symbol("Driving");
-  case FIT_SPORT_GOLF:
-    return Symbol("Golf");
-  case FIT_SPORT_HANG_GLIDING:
-    return Symbol("HangGliding");
-  case FIT_SPORT_HORSEBACK_RIDING:
-    return Symbol("HorsebackRiding");
-  case FIT_SPORT_HUNTING:
-    return Symbol("Hunting");
-  case FIT_SPORT_FISHING:
-    return Symbol("Fishing");
-  case FIT_SPORT_INLINE_SKATING:
-    return Symbol("InlineSkating");
-  case FIT_SPORT_ROCK_CLIMBING:
-    return Symbol("RockClimbing");
-  case FIT_SPORT_SAILING:
-    return Symbol("Sailing");
-  case FIT_SPORT_ICE_SKATING:
-    return Symbol("IceSkating");
-  case FIT_SPORT_SKY_DIVING:
-    return Symbol("SkyDiving");
-  case FIT_SPORT_SNOWSHOEING:
-    return Symbol("Snowshoeing");
-  case FIT_SPORT_SNOWMOBILING:
-    return Symbol("Snowmobiling");
-  case FIT_SPORT_STAND_UP_PADDLEBOARDING:
-    return Symbol("StandUpPaddleboarding");
-  case FIT_SPORT_SURFING:
-    return Symbol("Surfing");
-  case FIT_SPORT_WAKEBOARDING:
-    return Symbol("Wakeboarding");
-  case FIT_SPORT_WATER_SKIING:
-    return Symbol("WaterSkiing");
-  case FIT_SPORT_KAYAKING:
-    return Symbol("Kayaking");
-  case FIT_SPORT_RAFTING:
-    return Symbol("Rafting");
-  case FIT_SPORT_WINDSURFING:
-    return Symbol("Windsurfing");
-  case FIT_SPORT_KITESURFING:
-    return Symbol("Kitesurfing");
-  case FIT_SPORT_TACTICAL:
-    return Symbol("Tactical");
-  case FIT_SPORT_JUMPMASTER:
-    return Symbol("Jumpmaster");
-  case FIT_SPORT_BOXING:
-    return Symbol("Boxing");
-  case FIT_SPORT_FLOOR_CLIMBING:
-    return Symbol("FloorClimbing");
-  case FIT_SPORT_BASEBALL:
-    return Symbol("Baseball");
-  case FIT_SPORT_DIVING:
-    return Symbol("Diving");
-  case FIT_SPORT_SHOOTING:
-    return Symbol("Shooting");
-  case FIT_SPORT_WINTER_SPORT:
-    return Symbol("WinterSport");
-  case FIT_SPORT_GRINDING:
-    return Symbol("Grinding");
-  case FIT_SPORT_HIIT:
-    return Symbol("Hiit");
-  case FIT_SPORT_VIDEO_GAMING:
-    return Symbol("VideoGaming");
-  case FIT_SPORT_RACKET:
-    return Symbol("Racket");
-  case FIT_SPORT_WHEELCHAIR_PUSH_WALK:
-    return Symbol("WheelchairPushWalk");
-  case FIT_SPORT_WHEELCHAIR_PUSH_RUN:
-    return Symbol("WheelchairPushRun");
-  case FIT_SPORT_MEDITATION:
-    return Symbol("Meditation");
-  case FIT_SPORT_PARA_SPORT:
-    return Symbol("ParaSport");
-  case FIT_SPORT_DISC_GOLF:
-    return Symbol("DiscGolf");
-  case FIT_SPORT_TEAM_SPORT:
-    return Symbol("TeamSport");
-  case FIT_SPORT_CRICKET:
-    return Symbol("Cricket");
-  case FIT_SPORT_RUGBY:
-    return Symbol("Rugby");
-  case FIT_SPORT_HOCKEY:
-    return Symbol("Hockey");
-  case FIT_SPORT_LACROSSE:
-    return Symbol("Lacrosse");
-  case FIT_SPORT_VOLLEYBALL:
-    return Symbol("Volleyball");
-  case FIT_SPORT_WATER_TUBING:
-    return Symbol("WaterTubing");
-  case FIT_SPORT_WAKESURFING:
-    return Symbol("Wakesurfing");
-  case FIT_SPORT_WATER_SPORT:
-    return Symbol("WaterSport");
-  case FIT_SPORT_ARCHERY:
-    return Symbol("Archery");
-  case FIT_SPORT_MIXED_MARTIAL_ARTS:
-    return Symbol("MixedMartialArts");
-  case FIT_SPORT_MOTOR_SPORTS:
-    return Symbol("MotorSports");
-  case FIT_SPORT_SNORKELING:
-    return Symbol("Snorkeling");
-  case FIT_SPORT_DANCE:
-    return Symbol("Dance");
-  case FIT_SPORT_JUMP_ROPE:
-    return Symbol("JumpRope");
-  case FIT_SPORT_POOL_APNEA:
-    return Symbol("PoolApnea");
-  case FIT_SPORT_MOBILITY:
-    return Symbol("Mobility");
-  case FIT_SPORT_GEOCACHING:
-    return Symbol("Geocaching");
-  case FIT_SPORT_CANOEING:
-    return Symbol("Canoeing");
-  case FIT_SPORT_ALL:
-    return Symbol("All");
-  default:
-    return Symbol("Sport" + std::to_string(sport));
+  case FIT_SPORT_GENERIC:               return Symbol("Generic");
+  case FIT_SPORT_RUNNING:               return Symbol("Running");
+  case FIT_SPORT_CYCLING:               return Symbol("Cycling");
+  case FIT_SPORT_TRANSITION:            return Symbol("Transition");
+  case FIT_SPORT_FITNESS_EQUIPMENT:     return Symbol("FitnessEquipment");
+  case FIT_SPORT_SWIMMING:              return Symbol("Swimming");
+  case FIT_SPORT_BASKETBALL:            return Symbol("Basketball");
+  case FIT_SPORT_SOCCER:                return Symbol("Soccer");
+  case FIT_SPORT_TENNIS:                return Symbol("Tennis");
+  case FIT_SPORT_AMERICAN_FOOTBALL:     return Symbol("AmericanFootball");
+  case FIT_SPORT_TRAINING:              return Symbol("Training");
+  case FIT_SPORT_WALKING:               return Symbol("Walking");
+  case FIT_SPORT_CROSS_COUNTRY_SKIING:  return Symbol("CrossCountrySkiing");
+  case FIT_SPORT_ALPINE_SKIING:         return Symbol("AlpineSkiing");
+  case FIT_SPORT_SNOWBOARDING:          return Symbol("Snowboarding");
+  case FIT_SPORT_ROWING:                return Symbol("Rowing");
+  case FIT_SPORT_MOUNTAINEERING:        return Symbol("Mountaineering");
+  case FIT_SPORT_HIKING:                return Symbol("Hiking");
+  case FIT_SPORT_MULTISPORT:            return Symbol("Multisport");
+  case FIT_SPORT_PADDLING:              return Symbol("Paddling");
+  case FIT_SPORT_FLYING:                return Symbol("Flying");
+  case FIT_SPORT_E_BIKING:              return Symbol("EBiking");
+  case FIT_SPORT_MOTORCYCLING:          return Symbol("Motorcycling");
+  case FIT_SPORT_BOATING:               return Symbol("Boating");
+  case FIT_SPORT_DRIVING:               return Symbol("Driving");
+  case FIT_SPORT_GOLF:                  return Symbol("Golf");
+  case FIT_SPORT_HANG_GLIDING:          return Symbol("HangGliding");
+  case FIT_SPORT_HORSEBACK_RIDING:      return Symbol("HorsebackRiding");
+  case FIT_SPORT_HUNTING:               return Symbol("Hunting");
+  case FIT_SPORT_FISHING:               return Symbol("Fishing");
+  case FIT_SPORT_INLINE_SKATING:        return Symbol("InlineSkating");
+  case FIT_SPORT_ROCK_CLIMBING:         return Symbol("RockClimbing");
+  case FIT_SPORT_SAILING:               return Symbol("Sailing");
+  case FIT_SPORT_ICE_SKATING:           return Symbol("IceSkating");
+  case FIT_SPORT_SKY_DIVING:            return Symbol("SkyDiving");
+  case FIT_SPORT_SNOWSHOEING:           return Symbol("Snowshoeing");
+  case FIT_SPORT_SNOWMOBILING:          return Symbol("Snowmobiling");
+  case FIT_SPORT_STAND_UP_PADDLEBOARDING: return Symbol("StandUpPaddleboarding");
+  case FIT_SPORT_SURFING:               return Symbol("Surfing");
+  case FIT_SPORT_WAKEBOARDING:          return Symbol("Wakeboarding");
+  case FIT_SPORT_WATER_SKIING:          return Symbol("WaterSkiing");
+  case FIT_SPORT_KAYAKING:              return Symbol("Kayaking");
+  case FIT_SPORT_RAFTING:               return Symbol("Rafting");
+  case FIT_SPORT_WINDSURFING:           return Symbol("Windsurfing");
+  case FIT_SPORT_KITESURFING:           return Symbol("Kitesurfing");
+  case FIT_SPORT_TACTICAL:              return Symbol("Tactical");
+  case FIT_SPORT_JUMPMASTER:            return Symbol("Jumpmaster");
+  case FIT_SPORT_BOXING:                return Symbol("Boxing");
+  case FIT_SPORT_FLOOR_CLIMBING:        return Symbol("FloorClimbing");
+  case FIT_SPORT_BASEBALL:              return Symbol("Baseball");
+  case FIT_SPORT_DIVING:                return Symbol("Diving");
+  case FIT_SPORT_SHOOTING:              return Symbol("Shooting");
+  case FIT_SPORT_WINTER_SPORT:          return Symbol("WinterSport");
+  case FIT_SPORT_GRINDING:              return Symbol("Grinding");
+  case FIT_SPORT_HIIT:                  return Symbol("Hiit");
+  case FIT_SPORT_VIDEO_GAMING:          return Symbol("VideoGaming");
+  case FIT_SPORT_RACKET:                return Symbol("Racket");
+  case FIT_SPORT_WHEELCHAIR_PUSH_WALK:  return Symbol("WheelchairPushWalk");
+  case FIT_SPORT_WHEELCHAIR_PUSH_RUN:   return Symbol("WheelchairPushRun");
+  case FIT_SPORT_MEDITATION:            return Symbol("Meditation");
+  case FIT_SPORT_PARA_SPORT:            return Symbol("ParaSport");
+  case FIT_SPORT_DISC_GOLF:             return Symbol("DiscGolf");
+  case FIT_SPORT_TEAM_SPORT:            return Symbol("TeamSport");
+  case FIT_SPORT_CRICKET:               return Symbol("Cricket");
+  case FIT_SPORT_RUGBY:                 return Symbol("Rugby");
+  case FIT_SPORT_HOCKEY:                return Symbol("Hockey");
+  case FIT_SPORT_LACROSSE:              return Symbol("Lacrosse");
+  case FIT_SPORT_VOLLEYBALL:            return Symbol("Volleyball");
+  case FIT_SPORT_WATER_TUBING:          return Symbol("WaterTubing");
+  case FIT_SPORT_WAKESURFING:           return Symbol("Wakesurfing");
+  case FIT_SPORT_WATER_SPORT:           return Symbol("WaterSport");
+  case FIT_SPORT_ARCHERY:               return Symbol("Archery");
+  case FIT_SPORT_MIXED_MARTIAL_ARTS:    return Symbol("MixedMartialArts");
+  case FIT_SPORT_MOTOR_SPORTS:          return Symbol("MotorSports");
+  case FIT_SPORT_SNORKELING:            return Symbol("Snorkeling");
+  case FIT_SPORT_DANCE:                 return Symbol("Dance");
+  case FIT_SPORT_JUMP_ROPE:             return Symbol("JumpRope");
+  case FIT_SPORT_POOL_APNEA:            return Symbol("PoolApnea");
+  case FIT_SPORT_MOBILITY:              return Symbol("Mobility");
+  case FIT_SPORT_GEOCACHING:            return Symbol("Geocaching");
+  case FIT_SPORT_CANOEING:              return Symbol("Canoeing");
+  case FIT_SPORT_ALL:                   return Symbol("All");
+  default: return Symbol("Sport" + std::to_string(sport));
   }
 }
+
+// ── Column builder ─────────────────────────────────────────────────────────────
 
 struct ColumnBuilder {
   ExpressionSpanArguments spans;
@@ -225,12 +145,12 @@ struct ColumnBuilder {
   }
 
   template <typename V> void add(V&& value) {
-    using VecType = std::vector<std::decay_t<V>>;
-    if(!std::holds_alternative<VecType>(buffer)) {
+    using Vec = std::vector<std::decay_t<V>>;
+    if(!std::holds_alternative<Vec>(buffer)) {
       flush();
-      buffer = VecType {};
+      buffer = Vec{};
     }
-    std::get<VecType>(buffer).push_back(std::forward<V>(value));
+    std::get<Vec>(buffer).push_back(std::forward<V>(value));
     committedRows++;
   }
 
@@ -240,27 +160,47 @@ struct ColumnBuilder {
   }
 };
 
+// ── Message table ──────────────────────────────────────────────────────────────
+
 struct MessageTable {
   size_t rowCount = 0;
   std::map<std::string, ColumnBuilder> columns;
+
+  // Returns the named column padded with NULLs to the current row boundary.
+  ColumnBuilder& padded(const std::string& name) {
+    auto& col = columns[name];
+    while(col.committedRows < rowCount)
+      col.add(Symbol("NULL"));
+    return col;
+  }
+
+  // Advances to the next row, padding any columns that weren't written this row.
+  void finishRow() {
+    ++rowCount;
+    for(auto& [_, col] : columns)
+      if(col.committedRows < rowCount)
+        col.add(Symbol("NULL"));
+  }
 };
 
-// Parsing options exposed as symbolic flags on the LoadFIT operator.
-// Each flag is passed as a ComplexExpression: "flag_name"_(0_or_1).
-// Omitting a flag leaves its default in effect.
+// ── Parsing flags ──────────────────────────────────────────────────────────────
+
+// Options exposed as symbolic flags on LoadFIT: e.g. apply_scale_and_offset_(0).
 struct ParseFlags {
-  bool apply_scale_and_offset = true;   // use GetFLOAT64Value (scaled); false → GetRawValue
-  bool expand_components = true;        // let Decode expand component fields
-  bool expand_sub_fields = true;        // expose active sub-field as a separate column
-  bool convert_datetimes_to_dates = true; // shift FIT timestamps to Unix epoch
-  bool merge_heart_rates = false;       // interpolate HR from hr messages into target table
-  bool enable_crc_check = true;         // validate file CRC; false → SkipHeader
+  bool apply_scale_and_offset    = true;
+  bool expand_components         = true;
+  bool expand_sub_fields         = true;
+  bool convert_datetimes_to_dates = true;
+  bool merge_heart_rates         = false;
+  bool enable_crc_check          = true;
 };
 
-// Seconds between the FIT epoch (Dec 31 1989 00:00 UTC) and the Unix epoch.
+// ── Constants ──────────────────────────────────────────────────────────────────
+
+// Seconds between FIT epoch (Dec 31 1989 00:00 UTC) and Unix epoch.
 static constexpr double kFitEpochOffset = 631065600.0;
 
-// FIT timestamps below this value are relative (time-of-day), not absolute.
+// FIT timestamps below this value are relative (time-of-day), not absolute dates.
 static constexpr double kFitDateTimeMin = static_cast<double>(0x10000000u);
 
 static bool isDateTimeField(std::string_view name) {
@@ -272,477 +212,404 @@ struct HrPoint {
   double bpm;
 };
 
-} // namespace
+// ── Expression construction helpers ───────────────────────────────────────────
+
+static ComplexExpression makeColumn(std::string name, ColumnBuilder builder) {
+  return ComplexExpression(Symbol(std::move(name)), {}, {}, std::move(builder).build());
+}
+
+static ComplexExpression makeTable(ExpressionArguments columns) {
+  return ComplexExpression(Symbol("Table"), {}, std::move(columns), {});
+}
+
+// ── File collection ────────────────────────────────────────────────────────────
+
+static std::vector<std::filesystem::path> collectFitFiles(const std::string& path) {
+  std::vector<std::filesystem::path> paths;
+  if(std::filesystem::is_directory(path)) {
+    for(auto const& entry : std::filesystem::directory_iterator(path))
+      if(entry.path().extension() == ".fit")
+        paths.push_back(entry.path());
+    std::ranges::sort(paths);
+  } else {
+    paths.push_back(path);
+  }
+  return paths;
+}
+
+// ── Memory-mapped read-only file view ─────────────────────────────────────────
+
+struct MmapView {
+  const uint8_t* data = nullptr;
+  size_t size = 0;
+  std::string error;
+
+  explicit MmapView(const std::filesystem::path& path) {
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if(fd < 0) { error = "cannot open file: "s + path.string(); return; }
+    struct stat st{};
+    if(::fstat(fd, &st) < 0) {
+      ::close(fd);
+      error = "cannot stat file: "s + path.string();
+      return;
+    }
+    if(st.st_size == 0) { ::close(fd); return; }
+    void* mapping = ::mmap(nullptr, static_cast<size_t>(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);
+    if(mapping == MAP_FAILED) { error = "mmap failed for: "s + path.string(); return; }
+    data = static_cast<const uint8_t*>(mapping);
+    size = static_cast<size_t>(st.st_size);
+  }
+
+  ~MmapView() {
+    if(data) ::munmap(const_cast<uint8_t*>(data), size);
+  }
+
+  MmapView(const MmapView&) = delete;
+  MmapView& operator=(const MmapView&) = delete;
+
+  bool ok()    const { return error.empty(); }
+  bool empty() const { return size == 0; }
+};
+
+// ── Flag parsing ───────────────────────────────────────────────────────────────
+
+// Reads LoadFIT symbolic flags from dynamics[from..end]. Each flag is a
+// ComplexExpression flagName_(0_or_1); bare flag with no argument defaults to true.
+static ParseFlags parseFlags(ExpressionArguments& dynamics, size_t from) {
+  ParseFlags flags;
+  for(size_t i = from; i < dynamics.size(); ++i) {
+    auto* flagExpr = std::get_if<ComplexExpression>(&dynamics[i]);
+    if(!flagExpr) continue;
+    auto [head, statics, args, spans] = std::move(*flagExpr).decompose();
+    bool enabled = true;
+    if(!args.empty()) {
+      if(auto* iv = std::get_if<int64_t>(&args[0]))  enabled = (*iv != 0);
+      else if(auto* dv = std::get_if<double>(&args[0])) enabled = (*dv != 0.0);
+    }
+    auto const& name = head.getName();
+    if(name == "apply_scale_and_offset")          flags.apply_scale_and_offset = enabled;
+    else if(name == "expand_components")           flags.expand_components = enabled;
+    else if(name == "expand_sub_fields")           flags.expand_sub_fields = enabled;
+    else if(name == "convert_datetimes_to_dates")  flags.convert_datetimes_to_dates = enabled;
+    else if(name == "merge_heart_rates")           flags.merge_heart_rates = enabled;
+    else if(name == "enable_crc_check")            flags.enable_crc_check = enabled;
+  }
+  return flags;
+}
+
+// ── fit_skip config parsing ────────────────────────────────────────────────────
+
+// Builds a ParseConfig from dynamics[from..end]. Looks for a List_ of field
+// name symbols or strings to use as the column projection for msgType.
+static fit_skip::ParseConfig parseFitSkipConfig(ExpressionArguments& dynamics,
+                                                 const std::string& msgType, size_t from) {
+  fit_skip::ParseConfig cfg;
+  cfg.wanted_msgs.insert(msgType);
+  for(size_t i = from; i < dynamics.size(); ++i) {
+    auto* listExpr = std::get_if<ComplexExpression>(&dynamics[i]);
+    if(!listExpr || listExpr->getHead().getName() != "List") continue;
+    auto [head, statics, args, spans] = std::move(*listExpr).decompose();
+    auto& fieldSet = cfg.wanted_fields[msgType];
+    for(auto& arg : args) {
+      if(auto* sym = std::get_if<Symbol>(&arg))        fieldSet.insert(sym->getName());
+      else if(auto* str = std::get_if<std::string>(&arg)) fieldSet.insert(*str);
+    }
+    break;
+  }
+  return cfg;
+}
+
+// ── Metadata helpers ───────────────────────────────────────────────────────────
+
+static double firstRawVal(const fit_skip::RawTable& tbl, const std::string& colName) {
+  auto it = tbl.columns.find(colName);
+  if(it == tbl.columns.end() || tbl.row_count == 0)
+    return std::numeric_limits<double>::quiet_NaN();
+  auto const& col = it->second;
+  if(!col.is_double || col.doubles.empty() || col.is_null[0])
+    return std::numeric_limits<double>::quiet_NaN();
+  return col.doubles[0];
+}
+
+static void addScaled(ColumnBuilder& col, double value, double scale = 1.0) {
+  std::isnan(value) ? col.add(Symbol("NULL")) : col.add(value * scale);
+}
+
+static void addFitTimestamp(ColumnBuilder& col, double value) {
+  (std::isnan(value) || value < kFitDateTimeMin) ? col.add(Symbol("NULL"))
+                                                  : col.add(value + kFitEpochOffset);
+}
+
+// ── RawTable helpers ───────────────────────────────────────────────────────────
+
+static void mergeRawTable(fit_skip::RawTable& dst, const fit_skip::RawTable& src) {
+  for(auto const& [name, srcCol] : src.columns) {
+    auto& dstCol = dst.columns[name];
+    dstCol.pad_to(dst.row_count);
+    if(srcCol.is_double) {
+      dstCol.set_double_type();
+      for(size_t r = 0; r < src.row_count; ++r)
+        srcCol.is_null[r] ? dstCol.push_null() : dstCol.push_double(srcCol.doubles[r]);
+    } else {
+      dstCol.set_string_type();
+      for(size_t r = 0; r < src.row_count; ++r)
+        srcCol.is_null[r] ? dstCol.push_null() : dstCol.push_string(srcCol.strings[r]);
+    }
+  }
+  dst.row_count += src.row_count;
+}
+
+static Expression rawTableToBoss(fit_skip::RawTable& tbl) {
+  for(auto& [_, col] : tbl.columns)
+    col.pad_to(tbl.row_count);
+
+  auto columns = ExpressionArguments{};
+  for(auto& [name, col] : tbl.columns) {
+    ColumnBuilder builder;
+    if(col.is_double) {
+      for(size_t r = 0; r < tbl.row_count; ++r)
+        col.is_null[r] ? builder.add(Symbol("NULL")) : builder.add(col.doubles[r]);
+    } else {
+      for(size_t r = 0; r < tbl.row_count; ++r)
+        col.is_null[r] ? builder.add(Symbol("NULL")) : builder.add(col.strings[r]);
+    }
+    columns.emplace_back(makeColumn(name, std::move(builder)));
+  }
+  return makeTable(std::move(columns));
+}
+
+// ── Metadata table builder ─────────────────────────────────────────────────────
 
 // Scans one file or every .fit file in a directory and returns a Table with
 // one row per file containing activity metadata from file_id + session messages.
 static Expression buildMetadataTable(const std::string& path) {
-  auto filePaths = std::vector<std::filesystem::path>{};
-  if(std::filesystem::is_directory(path)) {
-    for(auto const& entry : std::filesystem::directory_iterator(path))
-      if(entry.path().extension() == ".fit")
-        filePaths.push_back(entry.path());
-    std::ranges::sort(filePaths);
-  } else {
-    filePaths.push_back(path);
-  }
-
   fit_skip::ParseConfig cfg;
   cfg.wanted_msgs.insert("file_id");
   cfg.wanted_msgs.insert("session");
 
-  ColumnBuilder cb_file, cb_time_created, cb_start_time, cb_sport;
-  ColumnBuilder cb_elapsed, cb_distance, cb_calories;
+  ColumnBuilder file, timeCreated, startTime, sport, elapsedSecs, distanceMeters, calories;
 
-  static auto first_val = [](const fit_skip::RawTable& tbl,
-                              const std::string& col_name) -> double {
-    auto cit = tbl.columns.find(col_name);
-    if(cit == tbl.columns.end() || tbl.row_count == 0)
-      return std::numeric_limits<double>::quiet_NaN();
-    auto& col = cit->second;
-    if(!col.is_double || col.doubles.empty() || col.is_null[0])
-      return std::numeric_limits<double>::quiet_NaN();
-    return col.doubles[0];
-  };
+  for(auto const& filePath : collectFitFiles(path)) {
+    MmapView view(filePath);
+    if(!view.ok())    return "LoadFIT::error: "s + view.error;
+    if(view.empty())  continue;
 
-  static auto add_d = [](ColumnBuilder& cb, double v, double scale = 1.0) {
-    if(std::isnan(v))
-      cb.add(Symbol("NULL"));
-    else
-      cb.add(v * scale);
-  };
+    auto result = fit_skip::parse(view.data, view.size, cfg);
+    if(!result.error.empty()) return "LoadFIT::error: "s + result.error;
 
-  static auto add_ts = [](ColumnBuilder& cb, double v) {
-    if(std::isnan(v) || v < kFitDateTimeMin)
-      cb.add(Symbol("NULL"));
-    else
-      cb.add(v + kFitEpochOffset);
-  };
+    double timeCreatedVal = std::numeric_limits<double>::quiet_NaN();
+    if(auto it = result.tables.find("file_id"); it != result.tables.end())
+      timeCreatedVal = firstRawVal(it->second, "time_created");
 
-  for(auto const& fp : filePaths) {
-    int fd = ::open(fp.c_str(), O_RDONLY);
-    if(fd < 0)
-      return "LoadFIT::error: cannot open file: "s + fp.string();
-    struct stat st{};
-    if(::fstat(fd, &st) < 0) {
-      ::close(fd);
-      return "LoadFIT::error: cannot stat file: "s + fp.string();
-    }
-    if(st.st_size == 0) {
-      ::close(fd);
-      continue;
-    }
-    void* mapped = ::mmap(nullptr, static_cast<size_t>(st.st_size),
-                          PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
-    if(mapped == MAP_FAILED)
-      return "LoadFIT::error: mmap failed for: "s + fp.string();
-
-    auto result = fit_skip::parse(static_cast<const uint8_t*>(mapped),
-                                  static_cast<size_t>(st.st_size), cfg);
-    ::munmap(mapped, static_cast<size_t>(st.st_size));
-
-    if(!result.error.empty())
-      return "LoadFIT::error: "s + result.error;
-
-    double time_created = std::numeric_limits<double>::quiet_NaN();
-    auto fid_it = result.tables.find("file_id");
-    if(fid_it != result.tables.end())
-      time_created = first_val(fid_it->second, "time_created");
-
-    double sport_val = std::numeric_limits<double>::quiet_NaN();
-    double start_time = std::numeric_limits<double>::quiet_NaN();
-    double elapsed    = std::numeric_limits<double>::quiet_NaN();
-    double distance   = std::numeric_limits<double>::quiet_NaN();
-    double calories   = std::numeric_limits<double>::quiet_NaN();
-    auto sess_it = result.tables.find("session");
-    if(sess_it != result.tables.end()) {
-      auto& st2 = sess_it->second;
-      sport_val  = first_val(st2, "sport");
-      start_time = first_val(st2, "start_time");
-      elapsed    = first_val(st2, "total_elapsed_time");
-      distance   = first_val(st2, "total_distance");
-      calories   = first_val(st2, "total_calories");
+    double sportVal    = std::numeric_limits<double>::quiet_NaN();
+    double startTimeVal = std::numeric_limits<double>::quiet_NaN();
+    double elapsedVal  = std::numeric_limits<double>::quiet_NaN();
+    double distanceVal = std::numeric_limits<double>::quiet_NaN();
+    double caloriesVal = std::numeric_limits<double>::quiet_NaN();
+    if(auto it = result.tables.find("session"); it != result.tables.end()) {
+      auto const& session = it->second;
+      sportVal     = firstRawVal(session, "sport");
+      startTimeVal = firstRawVal(session, "start_time");
+      elapsedVal   = firstRawVal(session, "total_elapsed_time");
+      distanceVal  = firstRawVal(session, "total_distance");
+      caloriesVal  = firstRawVal(session, "total_calories");
     }
 
-    cb_file.add(fp.string());
-    add_ts(cb_time_created, time_created);
-    add_ts(cb_start_time, start_time);
-    if(std::isnan(sport_val))
-      cb_sport.add(Symbol("NULL"));
-    else
-      cb_sport.add(fitSportName(static_cast<int>(sport_val)));
-    add_d(cb_elapsed,  elapsed,  1.0 / 1000.0); // ms → s
-    add_d(cb_distance, distance, 1.0 / 100.0);  // cm → m
-    add_d(cb_calories, calories);
+    file.add(filePath.string());
+    addFitTimestamp(timeCreated, timeCreatedVal);
+    addFitTimestamp(startTime, startTimeVal);
+    std::isnan(sportVal) ? sport.add(Symbol("NULL"))
+                         : sport.add(fitSportName(static_cast<int>(sportVal)));
+    addScaled(elapsedSecs,    elapsedVal,  1.0 / 1000.0); // ms → s
+    addScaled(distanceMeters, distanceVal, 1.0 / 100.0);  // cm → m
+    addScaled(calories,       caloriesVal);
   }
 
   auto columns = ExpressionArguments{};
-  auto push_col = [&](std::string name, ColumnBuilder& cb) {
-    columns.emplace_back(
-        ComplexExpression(Symbol(name), {}, {}, std::move(cb).build()));
-  };
-  push_col("file",               cb_file);
-  push_col("time_created",       cb_time_created);
-  push_col("start_time",         cb_start_time);
-  push_col("sport",              cb_sport);
-  push_col("total_elapsed_time", cb_elapsed);
-  push_col("total_distance",     cb_distance);
-  push_col("total_calories",     cb_calories);
-
-  return ComplexExpression(Symbol("Table"), {}, std::move(columns), {});
+  columns.emplace_back(makeColumn("file",               std::move(file)));
+  columns.emplace_back(makeColumn("time_created",       std::move(timeCreated)));
+  columns.emplace_back(makeColumn("start_time",         std::move(startTime)));
+  columns.emplace_back(makeColumn("sport",              std::move(sport)));
+  columns.emplace_back(makeColumn("total_elapsed_time", std::move(elapsedSecs)));
+  columns.emplace_back(makeColumn("total_distance",     std::move(distanceMeters)));
+  columns.emplace_back(makeColumn("total_calories",     std::move(calories)));
+  return makeTable(std::move(columns));
 }
+
+// ── Operator dispatch ──────────────────────────────────────────────────────────
 
 static Expression evaluate(Expression&& e) {
   using sentinel::Any_;
   using sentinel::Symbol_;
   using sentinel::AnySequence_;
-  return std::move(e) //
-         <"LoadFIT"_(Any_) >= Recurse(evaluate)>[](auto, auto dynamics, auto) -> Expression {
-           return buildMetadataTable(std::get<std::string>(dynamics.at(0)));
-         }
-         <"LoadFIT"_(Any_, Symbol_, AnySequence_) >= Recurse(evaluate)>[](auto, auto dynamics,
-                                                                           auto) -> Expression {
-           auto const& path = std::get<std::string>(dynamics.at(0));
-           auto const& msgType = std::get<Symbol>(dynamics.at(1)).getName();
+  return std::move(e)
+    <"LoadFIT"_(Any_) >= Recurse(evaluate)>
+    [](auto, auto dynamics, auto) -> Expression {
+      return buildMetadataTable(std::get<std::string>(dynamics.at(0)));
+    }
+    <"LoadFIT"_(Any_, Symbol_, AnySequence_) >= Recurse(evaluate)>
+    [](auto, auto dynamics, auto) -> Expression {
+      auto const& path    = std::get<std::string>(dynamics.at(0));
+      auto const& msgType = std::get<Symbol>(dynamics.at(1)).getName();
+      auto flags = parseFlags(dynamics, 2);
 
-           // Parse optional symbolic flags from dynamics[2+].
-           // Each flag is expressed as flagName_(value) where value is int64_t 0/1.
-           ParseFlags flags;
-           for(size_t i = 2; i < dynamics.size(); ++i) {
-             auto* flagExpr = std::get_if<ComplexExpression>(&dynamics[i]);
-             if(!flagExpr)
-               continue;
-             auto [flagHead, flagStatics, flagArgs, flagSpans] = std::move(*flagExpr).decompose();
-             bool value = true; // bare flag symbol with no argument defaults to true
-             if(!flagArgs.empty()) {
-               if(auto* iv = std::get_if<int64_t>(&flagArgs[0]))
-                 value = (*iv != 0);
-               else if(auto* dv = std::get_if<double>(&flagArgs[0]))
-                 value = (*dv != 0.0);
-             }
-             auto const& flagName = flagHead.getName();
-             if(flagName == "apply_scale_and_offset")
-               flags.apply_scale_and_offset = value;
-             else if(flagName == "expand_components")
-               flags.expand_components = value;
-             else if(flagName == "expand_sub_fields")
-               flags.expand_sub_fields = value;
-             else if(flagName == "convert_datetimes_to_dates")
-               flags.convert_datetimes_to_dates = value;
-             else if(flagName == "merge_heart_rates")
-               flags.merge_heart_rates = value;
-             else if(flagName == "enable_crc_check")
-               flags.enable_crc_check = value;
-           }
+      struct FitListener : fit::MesgListener {
+        std::string_view targetType;
+        ParseFlags flags;
+        std::unordered_map<std::string, MessageTable> tables;
+        std::vector<HrPoint> hrPoints;
+        std::vector<double> rowTimestamps;
 
-           auto filePaths = std::vector<std::filesystem::path> {};
-           if(std::filesystem::is_directory(path)) {
-             for(auto const& entry : std::filesystem::directory_iterator(path))
-               if(entry.path().extension() == ".fit")
-                 filePaths.push_back(entry.path());
-             std::ranges::sort(filePaths);
-           } else {
-             filePaths.push_back(path);
-           }
+        void addNumericValue(ColumnBuilder& col, fit::FieldBase* field,
+                             FIT_UINT16 subFieldIndex = FIT_SUBFIELD_INDEX_MAIN_FIELD) {
+          col.add(flags.apply_scale_and_offset ? field->GetFLOAT64Value(0, subFieldIndex)
+                                               : field->GetRawValue());
+        }
 
-           struct : fit::MesgListener {
-             std::string_view targetType;
-             ParseFlags flags;
-             std::unordered_map<std::string, MessageTable> tables;
-             std::vector<HrPoint> hrPoints;
-             std::vector<double> rowTimestamps;
+        void OnMesg(fit::Mesg& mesg) override {
+          if(flags.merge_heart_rates && mesg.GetName() == "hr") {
+            auto* tsField  = mesg.GetField("timestamp");
+            auto* bpmField = mesg.GetField("filtered_bpm");
+            if(tsField && tsField->IsValueValid() && bpmField && bpmField->IsValueValid())
+              hrPoints.push_back({tsField->GetFLOAT64Value(), bpmField->GetFLOAT64Value()});
+            return;
+          }
+          if(mesg.GetName() != targetType) return;
 
-             void addNumericValue(ColumnBuilder& column, fit::FieldBase* field,
-                                  FIT_UINT16 subFieldIndex = FIT_SUBFIELD_INDEX_MAIN_FIELD) {
-               if(flags.apply_scale_and_offset)
-                 column.add(field->GetFLOAT64Value(0, subFieldIndex));
-               else
-                 column.add(field->GetRawValue());
-             }
+          auto& table = tables[mesg.GetName()];
 
-             void OnMesg(fit::Mesg& mesg) override {
-               // Collect HR messages when merging heart rates.
-               if(flags.merge_heart_rates && mesg.GetName() == "hr") {
-                 auto* tsField = mesg.GetField("timestamp");
-                 auto* bpmField = mesg.GetField("filtered_bpm");
-                 if(tsField && tsField->IsValueValid() && bpmField && bpmField->IsValueValid())
-                   hrPoints.push_back({tsField->GetFLOAT64Value(), bpmField->GetFLOAT64Value()});
-                 return;
-               }
+          if(flags.merge_heart_rates) {
+            auto* tsField = mesg.GetField("timestamp");
+            rowTimestamps.push_back(
+                (tsField && tsField->IsValueValid()) ? tsField->GetFLOAT64Value() : -1.0);
+          }
 
-               if(mesg.GetName() != targetType)
-                 return;
+          for(FIT_UINT16 i = 0; i < (FIT_UINT16)mesg.GetNumFields(); i++) {
+            auto* field = mesg.GetFieldByIndex(i);
+            if(!field || !field->IsValid() || !field->IsValueValid()) continue;
 
-               auto& table = tables[mesg.GetName()];
+            auto& col = table.padded(field->GetName());
+            if(field->GetName() == "sport") {
+              col.add(fitSportName(static_cast<int>(field->GetFLOAT64Value())));
+            } else {
+              switch(field->GetType()) {
+              case FIT_BASE_TYPE_STRING: {
+                auto const& wstr = field->GetSTRINGValue();
+                col.add(std::string(wstr.begin(), wstr.end()));
+                break;
+              }
+              case FIT_BASE_TYPE_ENDIAN_FLAG:
+              case FIT_BASE_TYPE_RESERVED:
+              case FIT_BASE_TYPE_NUM_MASK:
+                break;
+              default: {
+                double rawVal = flags.apply_scale_and_offset ? field->GetFLOAT64Value()
+                                                             : field->GetRawValue();
+                if(flags.convert_datetimes_to_dates && isDateTimeField(field->GetName()) &&
+                   rawVal >= kFitDateTimeMin)
+                  col.add(rawVal + kFitEpochOffset);
+                else
+                  col.add(rawVal);
+                break;
+              }
+              }
+            }
 
-               // Stash this row's timestamp for HR interpolation later.
-               if(flags.merge_heart_rates) {
-                 auto* tsField = mesg.GetField("timestamp");
-                 rowTimestamps.push_back(
-                     (tsField && tsField->IsValueValid()) ? tsField->GetFLOAT64Value() : -1.0);
-               }
+            if(flags.expand_sub_fields && field->GetNumSubFields() > 0) {
+              FIT_UINT16 activeSubField = mesg.GetActiveSubFieldIndexByFieldIndex(i);
+              if(activeSubField != FIT_SUBFIELD_INDEX_MAIN_FIELD) {
+                auto const* subFieldProfile = field->GetSubField(activeSubField);
+                if(subFieldProfile && field->IsValueValid(0, activeSubField))
+                  addNumericValue(table.padded(subFieldProfile->name), field, activeSubField);
+              }
+            }
+          }
+          table.finishRow();
+        }
+      } listener;
+      listener.targetType = msgType;
+      listener.flags = flags;
 
-               for(FIT_UINT16 i = 0; i < (FIT_UINT16)mesg.GetNumFields(); i++) {
-                 auto* field = mesg.GetFieldByIndex(i);
-                 if(!field || !field->IsValid() || !field->IsValueValid())
-                   continue;
+      for(auto const& filePath : collectFitFiles(path)) {
+        auto file = std::fstream(filePath, std::ios::in | std::ios::binary);
+        if(!file.is_open()) return "LoadFIT::error: cannot open file: "s + filePath.string();
+        try {
+          fit::Decode decode;
+          if(!flags.expand_components) decode.SuppressComponentExpansion();
+          if(!flags.enable_crc_check)  decode.SkipHeader();
+          decode.Read(file, listener);
+        } catch(fit::RuntimeException const& e) { return "LoadFIT::error: "s + e.what(); }
+        catch(...)                               { return "LoadFIT::error: unknown exception during decode"s; }
+      }
 
-                 auto& column = table.columns[field->GetName()];
-                 while(column.committedRows < table.rowCount)
-                   column.add(Symbol("NULL"));
+      if(flags.merge_heart_rates && !listener.hrPoints.empty()) {
+        if(auto tableIt = listener.tables.find(msgType); tableIt != listener.tables.end()) {
+          auto& table = tableIt->second;
+          std::ranges::sort(listener.hrPoints, {}, &HrPoint::timestamp);
+          auto& hrCol = table.padded("heart_rate");
+          for(size_t row = 0; row < table.rowCount; ++row) {
+            while(hrCol.committedRows < row)
+              hrCol.add(Symbol("NULL"));
+            double ts = (row < listener.rowTimestamps.size()) ? listener.rowTimestamps[row] : -1.0;
+            if(ts < 0.0) { hrCol.add(Symbol("NULL")); continue; }
+            auto it = std::ranges::lower_bound(listener.hrPoints, ts, {}, &HrPoint::timestamp);
+            double bpm;
+            if(it == listener.hrPoints.end())        bpm = listener.hrPoints.back().bpm;
+            else if(it == listener.hrPoints.begin()) bpm = it->bpm;
+            else {
+              auto prev = std::prev(it);
+              bpm = (ts - prev->timestamp <= it->timestamp - ts) ? prev->bpm : it->bpm;
+            }
+            hrCol.add(bpm);
+          }
+          while(hrCol.committedRows < table.rowCount)
+            hrCol.add(Symbol("NULL"));
+        }
+      }
 
-                 if(field->GetName() == "sport") {
-                   column.add(fitSportName(static_cast<int>(field->GetFLOAT64Value())));
-                 } else {
-                   switch(field->GetType()) {
-                   case FIT_BASE_TYPE_STRING: {
-                     auto const& wstr = field->GetSTRINGValue();
-                     column.add(std::string(wstr.begin(), wstr.end()));
-                     break;
-                   }
-                   case FIT_BASE_TYPE_ENDIAN_FLAG:
-                   case FIT_BASE_TYPE_RESERVED:
-                   case FIT_BASE_TYPE_NUM_MASK:
-                     break;
-                   default: {
-                     double rawVal = flags.apply_scale_and_offset ? field->GetFLOAT64Value()
-                                                                  : field->GetRawValue();
-                     if(flags.convert_datetimes_to_dates && isDateTimeField(field->GetName()) &&
-                        rawVal >= kFitDateTimeMin)
-                       column.add(rawVal + kFitEpochOffset);
-                     else
-                       column.add(rawVal);
-                     break;
-                   }
-                   }
-                 }
+      auto tableIt = listener.tables.find(msgType);
+      if(tableIt == listener.tables.end())
+        return "LoadFIT::error: message type not found: "s + msgType;
 
-                 // Expose the active sub-field as its own column when requested.
-                 if(flags.expand_sub_fields && field->GetNumSubFields() > 0) {
-                   FIT_UINT16 activeSubField = mesg.GetActiveSubFieldIndexByFieldIndex(i);
-                   if(activeSubField != FIT_SUBFIELD_INDEX_MAIN_FIELD) {
-                     auto const* subFieldProfile = field->GetSubField(activeSubField);
-                     if(subFieldProfile && field->IsValueValid(0, activeSubField)) {
-                       std::string subFieldName(subFieldProfile->name);
-                       auto& sfColumn = table.columns[subFieldName];
-                       while(sfColumn.committedRows < table.rowCount)
-                         sfColumn.add(Symbol("NULL"));
-                       addNumericValue(sfColumn, field, activeSubField);
-                     }
-                   }
-                 }
-               }
+      auto columns = ExpressionArguments{};
+      for(auto& [name, col] : tableIt->second.columns)
+        columns.emplace_back(makeColumn(name, std::move(col)));
+      return makeTable(std::move(columns));
+    }
+    <"LoadFITFast"_(Any_) >= Recurse(evaluate)>
+    [](auto, auto dynamics, auto) -> Expression {
+      return buildMetadataTable(std::get<std::string>(dynamics.at(0)));
+    }
+    <"LoadFITFast"_(Any_, Symbol_, AnySequence_) >= Recurse(evaluate)>
+    [](auto, auto dynamics, auto) -> Expression {
+      auto const& path    = std::get<std::string>(dynamics.at(0));
+      auto const& msgType = std::get<Symbol>(dynamics.at(1)).getName();
+      auto cfg = parseFitSkipConfig(dynamics, msgType, 2);
 
-               table.rowCount++;
-               for(auto& [_, column] : table.columns)
-                 if(column.committedRows < table.rowCount)
-                   column.add(Symbol("NULL"));
-             }
-           } listener;
-           listener.targetType = msgType;
-           listener.flags = flags;
+      fit_skip::RawTable merged;
+      for(auto const& filePath : collectFitFiles(path)) {
+        MmapView view(filePath);
+        if(!view.ok())   return "LoadFITFast::error: "s + view.error;
+        if(view.empty()) continue;
 
-           for(auto const& filePath : filePaths) {
-             auto file = std::fstream(filePath, std::ios::in | std::ios::binary);
-             if(!file.is_open())
-               return "LoadFIT::error: cannot open file: "s + filePath.string();
-             try {
-               fit::Decode decode;
-               if(!flags.expand_components)
-                 decode.SuppressComponentExpansion();
-               if(!flags.enable_crc_check)
-                 decode.SkipHeader();
-               decode.Read(file, listener);
-             } catch(fit::RuntimeException const& e) {
-               return "LoadFIT::error: "s + e.what();
-             } catch(...) {
-               return "LoadFIT::error: unknown exception during decode"s;
-             }
-           }
+        auto result = fit_skip::parse(view.data, view.size, cfg);
+        if(!result.error.empty()) return "LoadFITFast::error: "s + result.error;
 
-           // Merge heart rate data: nearest-neighbour interpolation by timestamp.
-           if(flags.merge_heart_rates && !listener.hrPoints.empty()) {
-             auto tableIt = listener.tables.find(msgType);
-             if(tableIt != listener.tables.end()) {
-               auto& table = tableIt->second;
-               std::ranges::sort(listener.hrPoints, {}, &HrPoint::timestamp);
-               auto& hrColumn = table.columns["heart_rate"];
-               for(size_t row = 0; row < table.rowCount; ++row) {
-                 while(hrColumn.committedRows < row)
-                   hrColumn.add(Symbol("NULL"));
-                 double ts = (row < listener.rowTimestamps.size()) ? listener.rowTimestamps[row]
-                                                                   : -1.0;
-                 if(ts < 0.0) {
-                   hrColumn.add(Symbol("NULL"));
-                   continue;
-                 }
-                 auto it = std::ranges::lower_bound(listener.hrPoints, ts, {},
-                                                    &HrPoint::timestamp);
-                 double bpm;
-                 if(it == listener.hrPoints.end())
-                   bpm = listener.hrPoints.back().bpm;
-                 else if(it == listener.hrPoints.begin())
-                   bpm = it->bpm;
-                 else {
-                   auto prev = std::prev(it);
-                   bpm = (ts - prev->timestamp <= it->timestamp - ts) ? prev->bpm : it->bpm;
-                 }
-                 hrColumn.add(bpm);
-               }
-               while(hrColumn.committedRows < table.rowCount)
-                 hrColumn.add(Symbol("NULL"));
-             }
-           }
+        if(auto it = result.tables.find(msgType); it != result.tables.end())
+          mergeRawTable(merged, it->second);
+      }
 
-           auto tableEntry = listener.tables.find(msgType);
-           if(tableEntry == listener.tables.end())
-             return "LoadFIT::error: message type not found: "s + msgType;
+      if(merged.row_count == 0)
+        return "LoadFITFast::error: message type not found: "s + msgType;
 
-           auto columns = ExpressionArguments {};
-           for(auto& [name, column] : tableEntry->second.columns)
-             columns.emplace_back(
-                 ComplexExpression(Symbol(name), {}, {}, std::move(column).build()));
+      return rawTableToBoss(merged);
+    }
+    < Any_ >= Recurse(evaluate);
+}
 
-           return ComplexExpression(Symbol("Table"), {}, std::move(columns), {});
-         }
-         <"LoadFITFast"_(Any_) >= Recurse(evaluate)>
-         [](auto, auto dynamics, auto) -> Expression {
-           return buildMetadataTable(std::get<std::string>(dynamics.at(0)));
-         }
-         <"LoadFITFast"_(Any_, Symbol_, AnySequence_) >= Recurse(evaluate)>
-         [](auto, auto dynamics, auto) -> Expression {
-           auto const& path = std::get<std::string>(dynamics.at(0));
-           auto const& msgType = std::get<Symbol>(dynamics.at(1)).getName();
-
-           // dynamics[2] may be a List_ of field names to project; the rest are ignored.
-           fit_skip::ParseConfig cfg;
-           cfg.wanted_msgs.insert(msgType);
-
-           for(size_t i = 2; i < dynamics.size(); ++i) {
-             auto* listExpr = std::get_if<ComplexExpression>(&dynamics[i]);
-             if(!listExpr || listExpr->getHead().getName() != "List")
-               continue;
-             auto [lHead, lStatics, lArgs, lSpans] = std::move(*listExpr).decompose();
-             auto& fieldSet = cfg.wanted_fields[msgType];
-             for(auto& arg : lArgs) {
-               if(auto* sym = std::get_if<Symbol>(&arg))
-                 fieldSet.insert(sym->getName());
-               else if(auto* str = std::get_if<std::string>(&arg))
-                 fieldSet.insert(*str);
-             }
-             break;
-           }
-
-           auto filePaths = std::vector<std::filesystem::path>{};
-           if(std::filesystem::is_directory(path)) {
-             for(auto const& entry : std::filesystem::directory_iterator(path))
-               if(entry.path().extension() == ".fit")
-                 filePaths.push_back(entry.path());
-             std::ranges::sort(filePaths);
-           } else {
-             filePaths.push_back(path);
-           }
-
-           // Accumulate rows across files into a single merged RawTable.
-           fit_skip::RawTable merged;
-
-           for(auto const& filePath : filePaths) {
-             int fd = ::open(filePath.c_str(), O_RDONLY);
-             if(fd < 0)
-               return "LoadFITFast::error: cannot open file: "s + filePath.string();
-
-             struct stat st{};
-             if(::fstat(fd, &st) < 0) {
-               ::close(fd);
-               return "LoadFITFast::error: cannot stat file: "s + filePath.string();
-             }
-
-             if(st.st_size == 0) {
-               ::close(fd);
-               continue;
-             }
-
-             void* mapped = ::mmap(nullptr, static_cast<size_t>(st.st_size),
-                                   PROT_READ, MAP_PRIVATE, fd, 0);
-             ::close(fd);
-             if(mapped == MAP_FAILED)
-               return "LoadFITFast::error: mmap failed for: "s + filePath.string();
-
-             auto const* data = static_cast<const uint8_t*>(mapped);
-             auto result = fit_skip::parse(data, static_cast<size_t>(st.st_size), cfg);
-             ::munmap(mapped, static_cast<size_t>(st.st_size));
-
-             if(!result.error.empty())
-               return "LoadFITFast::error: "s + result.error;
-
-             auto it = result.tables.find(msgType);
-             if(it == result.tables.end())
-               continue;
-
-             auto& src = it->second;
-             // Append src into merged: pad existing columns, then copy rows.
-             // doubles[] and strings[] each have one entry per row (nulls included).
-             for(auto& [colName, srcCol] : src.columns) {
-               auto& dstCol = merged.columns[colName];
-               dstCol.pad_to(merged.row_count);
-               if(srcCol.is_double) {
-                 dstCol.set_double_type();
-                 for(size_t r = 0; r < src.row_count; ++r) {
-                   if(srcCol.is_null[r])
-                     dstCol.push_null();
-                   else
-                     dstCol.push_double(srcCol.doubles[r]);
-                 }
-               } else {
-                 dstCol.set_string_type();
-                 for(size_t r = 0; r < src.row_count; ++r) {
-                   if(srcCol.is_null[r])
-                     dstCol.push_null();
-                   else
-                     dstCol.push_string(srcCol.strings[r]);
-                 }
-               }
-             }
-             merged.row_count += src.row_count;
-           }
-
-           if(merged.row_count == 0)
-             return "LoadFITFast::error: message type not found: "s + msgType;
-
-           // Pad any columns that are shorter than the total row count.
-           for(auto& [_, col] : merged.columns)
-             col.pad_to(merged.row_count);
-
-           // Convert RawTable → BOSS Table.
-           // doubles[] and strings[] each have one slot per row (nulls included).
-           auto columns = ExpressionArguments{};
-           for(auto& [name, col] : merged.columns) {
-             ColumnBuilder builder;
-             if(col.is_double) {
-               for(size_t r = 0; r < merged.row_count; ++r) {
-                 if(col.is_null[r])
-                   builder.add(Symbol("NULL"));
-                 else
-                   builder.add(col.doubles[r]);
-               }
-             } else {
-               for(size_t r = 0; r < merged.row_count; ++r) {
-                 if(col.is_null[r])
-                   builder.add(Symbol("NULL"));
-                 else
-                   builder.add(col.strings[r]);
-               }
-             }
-             columns.emplace_back(
-                 ComplexExpression(Symbol(name), {}, {}, std::move(builder).build()));
-           }
-
-           return ComplexExpression(Symbol("Table"), {}, std::move(columns), {});
-         }
-         < Any_ >= Recurse(evaluate);
-};
+} // namespace
 
 extern "C" BOSSExpression* evaluate(BOSSExpression* e) {
-  return new BOSSExpression {.delegate = evaluate(std::move(e->delegate))};
-};
+  return new BOSSExpression{.delegate = evaluate(std::move(e->delegate))};
+}
