@@ -10,11 +10,17 @@
 #include "fit_profile.hpp"
 #include "fit_runtime_exception.hpp"
 
+#include "fit_skip.hpp"
+
 #include <algorithm>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <string>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -477,7 +483,138 @@ static Expression evaluate(Expression&& e) {
                  ComplexExpression(Symbol(name), {}, {}, std::move(column).build()));
 
            return ComplexExpression(Symbol("Table"), {}, std::move(columns), {});
-         } < Any_ >= Recurse(evaluate);
+         }
+         <"LoadFITFast"_(Any_, Symbol_, AnySequence_) >= Recurse(evaluate)>
+         [](auto, auto dynamics, auto) -> Expression {
+           auto const& path = std::get<std::string>(dynamics.at(0));
+           auto const& msgType = std::get<Symbol>(dynamics.at(1)).getName();
+
+           // dynamics[2] may be a List_ of field names to project; the rest are ignored.
+           fit_skip::ParseConfig cfg;
+           cfg.wanted_msgs.insert(msgType);
+
+           for(size_t i = 2; i < dynamics.size(); ++i) {
+             auto* listExpr = std::get_if<ComplexExpression>(&dynamics[i]);
+             if(!listExpr || listExpr->getHead().getName() != "List")
+               continue;
+             auto [lHead, lStatics, lArgs, lSpans] = std::move(*listExpr).decompose();
+             auto& fieldSet = cfg.wanted_fields[msgType];
+             for(auto& arg : lArgs) {
+               if(auto* sym = std::get_if<Symbol>(&arg))
+                 fieldSet.insert(sym->getName());
+               else if(auto* str = std::get_if<std::string>(&arg))
+                 fieldSet.insert(*str);
+             }
+             break;
+           }
+
+           auto filePaths = std::vector<std::filesystem::path>{};
+           if(std::filesystem::is_directory(path)) {
+             for(auto const& entry : std::filesystem::directory_iterator(path))
+               if(entry.path().extension() == ".fit")
+                 filePaths.push_back(entry.path());
+             std::ranges::sort(filePaths);
+           } else {
+             filePaths.push_back(path);
+           }
+
+           // Accumulate rows across files into a single merged RawTable.
+           fit_skip::RawTable merged;
+
+           for(auto const& filePath : filePaths) {
+             int fd = ::open(filePath.c_str(), O_RDONLY);
+             if(fd < 0)
+               return "LoadFITFast::error: cannot open file: "s + filePath.string();
+
+             struct stat st{};
+             if(::fstat(fd, &st) < 0) {
+               ::close(fd);
+               return "LoadFITFast::error: cannot stat file: "s + filePath.string();
+             }
+
+             if(st.st_size == 0) {
+               ::close(fd);
+               continue;
+             }
+
+             void* mapped = ::mmap(nullptr, static_cast<size_t>(st.st_size),
+                                   PROT_READ, MAP_PRIVATE, fd, 0);
+             ::close(fd);
+             if(mapped == MAP_FAILED)
+               return "LoadFITFast::error: mmap failed for: "s + filePath.string();
+
+             auto const* data = static_cast<const uint8_t*>(mapped);
+             auto result = fit_skip::parse(data, static_cast<size_t>(st.st_size), cfg);
+             ::munmap(mapped, static_cast<size_t>(st.st_size));
+
+             if(!result.error.empty())
+               return "LoadFITFast::error: "s + result.error;
+
+             auto it = result.tables.find(msgType);
+             if(it == result.tables.end())
+               continue;
+
+             auto& src = it->second;
+             // Append src into merged: pad existing columns, then copy rows.
+             // doubles[] and strings[] each have one entry per row (nulls included).
+             for(auto& [colName, srcCol] : src.columns) {
+               auto& dstCol = merged.columns[colName];
+               dstCol.pad_to(merged.row_count);
+               if(srcCol.is_double) {
+                 dstCol.set_double_type();
+                 for(size_t r = 0; r < src.row_count; ++r) {
+                   if(srcCol.is_null[r])
+                     dstCol.push_null();
+                   else
+                     dstCol.push_double(srcCol.doubles[r]);
+                 }
+               } else {
+                 dstCol.set_string_type();
+                 for(size_t r = 0; r < src.row_count; ++r) {
+                   if(srcCol.is_null[r])
+                     dstCol.push_null();
+                   else
+                     dstCol.push_string(srcCol.strings[r]);
+                 }
+               }
+             }
+             merged.row_count += src.row_count;
+           }
+
+           if(merged.row_count == 0)
+             return "LoadFITFast::error: message type not found: "s + msgType;
+
+           // Pad any columns that are shorter than the total row count.
+           for(auto& [_, col] : merged.columns)
+             col.pad_to(merged.row_count);
+
+           // Convert RawTable → BOSS Table.
+           // doubles[] and strings[] each have one slot per row (nulls included).
+           auto columns = ExpressionArguments{};
+           for(auto& [name, col] : merged.columns) {
+             ColumnBuilder builder;
+             if(col.is_double) {
+               for(size_t r = 0; r < merged.row_count; ++r) {
+                 if(col.is_null[r])
+                   builder.add(Symbol("NULL"));
+                 else
+                   builder.add(col.doubles[r]);
+               }
+             } else {
+               for(size_t r = 0; r < merged.row_count; ++r) {
+                 if(col.is_null[r])
+                   builder.add(Symbol("NULL"));
+                 else
+                   builder.add(col.strings[r]);
+               }
+             }
+             columns.emplace_back(
+                 ComplexExpression(Symbol(name), {}, {}, std::move(builder).build()));
+           }
+
+           return ComplexExpression(Symbol("Table"), {}, std::move(columns), {});
+         }
+         < Any_ >= Recurse(evaluate);
 };
 
 extern "C" BOSSExpression* evaluate(BOSSExpression* e) {
