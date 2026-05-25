@@ -484,6 +484,129 @@ static Expression evaluate(Expression&& e) {
 
            return ComplexExpression(Symbol("Table"), {}, std::move(columns), {});
          }
+         <"LoadFITFast"_(Any_) >= Recurse(evaluate)>
+         [](auto, auto dynamics, auto) -> Expression {
+           auto const& path = std::get<std::string>(dynamics.at(0));
+
+           auto filePaths = std::vector<std::filesystem::path>{};
+           if(std::filesystem::is_directory(path)) {
+             for(auto const& entry : std::filesystem::directory_iterator(path))
+               if(entry.path().extension() == ".fit")
+                 filePaths.push_back(entry.path());
+             std::ranges::sort(filePaths);
+           } else {
+             filePaths.push_back(path);
+           }
+
+           // Per-file metadata: file_id and session messages are sufficient.
+           fit_skip::ParseConfig cfg;
+           cfg.wanted_msgs.insert("file_id");
+           cfg.wanted_msgs.insert("session");
+
+           ColumnBuilder cb_file, cb_time_created, cb_start_time, cb_sport;
+           ColumnBuilder cb_elapsed, cb_distance, cb_calories;
+
+           for(auto const& fp : filePaths) {
+             int fd = ::open(fp.c_str(), O_RDONLY);
+             if(fd < 0)
+               return "LoadFITFast::error: cannot open file: "s + fp.string();
+             struct stat st{};
+             if(::fstat(fd, &st) < 0) {
+               ::close(fd);
+               return "LoadFITFast::error: cannot stat file: "s + fp.string();
+             }
+             if(st.st_size == 0) {
+               ::close(fd);
+               continue;
+             }
+             void* mapped = ::mmap(nullptr, static_cast<size_t>(st.st_size),
+                                   PROT_READ, MAP_PRIVATE, fd, 0);
+             ::close(fd);
+             if(mapped == MAP_FAILED)
+               return "LoadFITFast::error: mmap failed for: "s + fp.string();
+
+             auto result = fit_skip::parse(static_cast<const uint8_t*>(mapped),
+                                           static_cast<size_t>(st.st_size), cfg);
+             ::munmap(mapped, static_cast<size_t>(st.st_size));
+
+             if(!result.error.empty())
+               return "LoadFITFast::error: "s + result.error;
+
+             // Helper: first non-null double from a RawTable column.
+             auto first_val = [](const fit_skip::RawTable& tbl,
+                                  const std::string& col_name) -> double {
+               auto cit = tbl.columns.find(col_name);
+               if(cit == tbl.columns.end() || tbl.row_count == 0)
+                 return std::numeric_limits<double>::quiet_NaN();
+               auto& col = cit->second;
+               if(!col.is_double || col.doubles.empty() || col.is_null[0])
+                 return std::numeric_limits<double>::quiet_NaN();
+               return col.doubles[0];
+             };
+
+             double time_created = std::numeric_limits<double>::quiet_NaN();
+             auto fid_it = result.tables.find("file_id");
+             if(fid_it != result.tables.end())
+               time_created = first_val(fid_it->second, "time_created");
+
+             double sport_val = std::numeric_limits<double>::quiet_NaN();
+             double start_time = std::numeric_limits<double>::quiet_NaN();
+             double elapsed    = std::numeric_limits<double>::quiet_NaN();
+             double distance   = std::numeric_limits<double>::quiet_NaN();
+             double calories   = std::numeric_limits<double>::quiet_NaN();
+             auto sess_it = result.tables.find("session");
+             if(sess_it != result.tables.end()) {
+               auto& st2 = sess_it->second;
+               sport_val  = first_val(st2, "sport");
+               start_time = first_val(st2, "start_time");
+               elapsed    = first_val(st2, "total_elapsed_time");
+               distance   = first_val(st2, "total_distance");
+               calories   = first_val(st2, "total_calories");
+             }
+
+             // Helper to add scaled-double-or-NULL.
+             auto add_d = [](ColumnBuilder& cb, double v, double scale = 1.0) {
+               if(std::isnan(v))
+                 cb.add(Symbol("NULL"));
+               else
+                 cb.add(v * scale);
+             };
+
+             // Helper to add FIT-datetime-or-NULL (raw → Unix epoch seconds).
+             auto add_ts = [](ColumnBuilder& cb, double v) {
+               if(std::isnan(v) || v < kFitDateTimeMin)
+                 cb.add(Symbol("NULL"));
+               else
+                 cb.add(v + kFitEpochOffset);
+             };
+
+             cb_file.add(fp.string());
+             add_ts(cb_time_created, time_created);
+             add_ts(cb_start_time, start_time);
+             if(std::isnan(sport_val))
+               cb_sport.add(Symbol("NULL"));
+             else
+               cb_sport.add(fitSportName(static_cast<int>(sport_val)));
+             add_d(cb_elapsed,  elapsed,  1.0 / 1000.0); // ms → s
+             add_d(cb_distance, distance, 1.0 / 100.0);  // cm → m
+             add_d(cb_calories, calories);
+           }
+
+           auto columns = ExpressionArguments{};
+           auto push_col = [&](std::string name, ColumnBuilder& cb) {
+             columns.emplace_back(
+                 ComplexExpression(Symbol(name), {}, {}, std::move(cb).build()));
+           };
+           push_col("file",               cb_file);
+           push_col("time_created",       cb_time_created);
+           push_col("start_time",         cb_start_time);
+           push_col("sport",              cb_sport);
+           push_col("total_elapsed_time", cb_elapsed);
+           push_col("total_distance",     cb_distance);
+           push_col("total_calories",     cb_calories);
+
+           return ComplexExpression(Symbol("Table"), {}, std::move(columns), {});
+         }
          <"LoadFITFast"_(Any_, Symbol_, AnySequence_) >= Recurse(evaluate)>
          [](auto, auto dynamics, auto) -> Expression {
            auto const& path = std::get<std::string>(dynamics.at(0));
