@@ -4,10 +4,13 @@
 #include <Utilities.hpp>
 
 #include "fit_decode.hpp"
+#include "fit_hr_mesg.hpp"
 #include "fit_mesg.hpp"
 #include "fit_mesg_listener.hpp"
+#include "fit_profile.hpp"
 #include "fit_runtime_exception.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -236,16 +239,74 @@ struct MessageTable {
   std::map<std::string, ColumnBuilder> columns;
 };
 
+// Parsing options exposed as symbolic flags on the LoadFIT operator.
+// Each flag is passed as a ComplexExpression: "flag_name"_(0_or_1).
+// Omitting a flag leaves its default in effect.
+struct ParseFlags {
+  bool apply_scale_and_offset = true;   // use GetFLOAT64Value (scaled); false → GetRawValue
+  bool expand_components = true;        // let Decode expand component fields
+  bool expand_sub_fields = true;        // expose active sub-field as a separate column
+  bool convert_datetimes_to_dates = true; // shift FIT timestamps to Unix epoch
+  bool merge_heart_rates = false;       // interpolate HR from hr messages into target table
+  bool enable_crc_check = true;         // validate file CRC; false → SkipHeader
+};
+
+// Seconds between the FIT epoch (Dec 31 1989 00:00 UTC) and the Unix epoch.
+static constexpr double kFitEpochOffset = 631065600.0;
+
+// FIT timestamps below this value are relative (time-of-day), not absolute.
+static constexpr double kFitDateTimeMin = static_cast<double>(0x10000000u);
+
+static bool isDateTimeField(std::string_view name) {
+  return name == "timestamp" || name == "local_timestamp";
+}
+
+struct HrPoint {
+  double timestamp;
+  double bpm;
+};
+
 } // namespace
 
 static Expression evaluate(Expression&& e) {
   using sentinel::Any_;
   using sentinel::Symbol_;
+  using sentinel::AnySequence_;
   return std::move(e) //
-         <"LoadFIT"_(Any_, Symbol_) >= Recurse(evaluate)>[](auto, auto dynamics,
-                                                            auto) -> Expression {
+         <"LoadFIT"_(Any_, Symbol_, AnySequence_) >= Recurse(evaluate)>[](auto, auto dynamics,
+                                                                           auto) -> Expression {
            auto const& path = std::get<std::string>(dynamics.at(0));
            auto const& msgType = std::get<Symbol>(dynamics.at(1)).getName();
+
+           // Parse optional symbolic flags from dynamics[2+].
+           // Each flag is expressed as flagName_(value) where value is int64_t 0/1.
+           ParseFlags flags;
+           for(size_t i = 2; i < dynamics.size(); ++i) {
+             auto* flagExpr = std::get_if<ComplexExpression>(&dynamics[i]);
+             if(!flagExpr)
+               continue;
+             auto [flagHead, flagStatics, flagArgs, flagSpans] = std::move(*flagExpr).decompose();
+             bool value = true; // bare flag symbol with no argument defaults to true
+             if(!flagArgs.empty()) {
+               if(auto* iv = std::get_if<int64_t>(&flagArgs[0]))
+                 value = (*iv != 0);
+               else if(auto* dv = std::get_if<double>(&flagArgs[0]))
+                 value = (*dv != 0.0);
+             }
+             auto const& flagName = flagHead.getName();
+             if(flagName == "apply_scale_and_offset")
+               flags.apply_scale_and_offset = value;
+             else if(flagName == "expand_components")
+               flags.expand_components = value;
+             else if(flagName == "expand_sub_fields")
+               flags.expand_sub_fields = value;
+             else if(flagName == "convert_datetimes_to_dates")
+               flags.convert_datetimes_to_dates = value;
+             else if(flagName == "merge_heart_rates")
+               flags.merge_heart_rates = value;
+             else if(flagName == "enable_crc_check")
+               flags.enable_crc_check = value;
+           }
 
            auto filePaths = std::vector<std::filesystem::path> {};
            if(std::filesystem::is_directory(path)) {
@@ -259,21 +320,53 @@ static Expression evaluate(Expression&& e) {
 
            struct : fit::MesgListener {
              std::string_view targetType;
+             ParseFlags flags;
              std::unordered_map<std::string, MessageTable> tables;
+             std::vector<HrPoint> hrPoints;
+             std::vector<double> rowTimestamps;
+
+             void addNumericValue(ColumnBuilder& column, fit::FieldBase* field,
+                                  FIT_UINT16 subFieldIndex = FIT_SUBFIELD_INDEX_MAIN_FIELD) {
+               if(flags.apply_scale_and_offset)
+                 column.add(field->GetFLOAT64Value(0, subFieldIndex));
+               else
+                 column.add(field->GetRawValue());
+             }
+
              void OnMesg(fit::Mesg& mesg) override {
+               // Collect HR messages when merging heart rates.
+               if(flags.merge_heart_rates && mesg.GetName() == "hr") {
+                 auto* tsField = mesg.GetField("timestamp");
+                 auto* bpmField = mesg.GetField("filtered_bpm");
+                 if(tsField && tsField->IsValueValid() && bpmField && bpmField->IsValueValid())
+                   hrPoints.push_back({tsField->GetFLOAT64Value(), bpmField->GetFLOAT64Value()});
+                 return;
+               }
+
                if(mesg.GetName() != targetType)
                  return;
+
                auto& table = tables[mesg.GetName()];
+
+               // Stash this row's timestamp for HR interpolation later.
+               if(flags.merge_heart_rates) {
+                 auto* tsField = mesg.GetField("timestamp");
+                 rowTimestamps.push_back(
+                     (tsField && tsField->IsValueValid()) ? tsField->GetFLOAT64Value() : -1.0);
+               }
+
                for(FIT_UINT16 i = 0; i < (FIT_UINT16)mesg.GetNumFields(); i++) {
                  auto* field = mesg.GetFieldByIndex(i);
                  if(!field || !field->IsValid() || !field->IsValueValid())
                    continue;
+
                  auto& column = table.columns[field->GetName()];
                  while(column.committedRows < table.rowCount)
                    column.add(Symbol("NULL"));
-                 if(field->GetName() == "sport")
+
+                 if(field->GetName() == "sport") {
                    column.add(fitSportName(static_cast<int>(field->GetFLOAT64Value())));
-                 else {
+                 } else {
                    switch(field->GetType()) {
                    case FIT_BASE_TYPE_STRING: {
                      auto const& wstr = field->GetSTRINGValue();
@@ -284,12 +377,35 @@ static Expression evaluate(Expression&& e) {
                    case FIT_BASE_TYPE_RESERVED:
                    case FIT_BASE_TYPE_NUM_MASK:
                      break;
-                   default:
-                     // GetFLOAT64Value applies scale and offset as defined by the FIT profile
-                     column.add(field->GetFLOAT64Value());
+                   default: {
+                     double rawVal = flags.apply_scale_and_offset ? field->GetFLOAT64Value()
+                                                                  : field->GetRawValue();
+                     if(flags.convert_datetimes_to_dates && isDateTimeField(field->GetName()) &&
+                        rawVal >= kFitDateTimeMin)
+                       column.add(rawVal + kFitEpochOffset);
+                     else
+                       column.add(rawVal);
+                     break;
+                   }
+                   }
+                 }
+
+                 // Expose the active sub-field as its own column when requested.
+                 if(flags.expand_sub_fields && field->GetNumSubFields() > 0) {
+                   FIT_UINT16 activeSubField = mesg.GetActiveSubFieldIndexByFieldIndex(i);
+                   if(activeSubField != FIT_SUBFIELD_INDEX_MAIN_FIELD) {
+                     auto const* subFieldProfile = field->GetSubField(activeSubField);
+                     if(subFieldProfile && field->IsValueValid(0, activeSubField)) {
+                       std::string subFieldName(subFieldProfile->name);
+                       auto& sfColumn = table.columns[subFieldName];
+                       while(sfColumn.committedRows < table.rowCount)
+                         sfColumn.add(Symbol("NULL"));
+                       addNumericValue(sfColumn, field, activeSubField);
+                     }
                    }
                  }
                }
+
                table.rowCount++;
                for(auto& [_, column] : table.columns)
                  if(column.committedRows < table.rowCount)
@@ -297,17 +413,57 @@ static Expression evaluate(Expression&& e) {
              }
            } listener;
            listener.targetType = msgType;
+           listener.flags = flags;
 
            for(auto const& filePath : filePaths) {
              auto file = std::fstream(filePath, std::ios::in | std::ios::binary);
              if(!file.is_open())
                return "LoadFIT::error: cannot open file: "s + filePath.string();
              try {
-               fit::Decode().Read(file, listener);
+               fit::Decode decode;
+               if(!flags.expand_components)
+                 decode.SuppressComponentExpansion();
+               if(!flags.enable_crc_check)
+                 decode.SkipHeader();
+               decode.Read(file, listener);
              } catch(fit::RuntimeException const& e) {
                return "LoadFIT::error: "s + e.what();
              } catch(...) {
                return "LoadFIT::error: unknown exception during decode"s;
+             }
+           }
+
+           // Merge heart rate data: nearest-neighbour interpolation by timestamp.
+           if(flags.merge_heart_rates && !listener.hrPoints.empty()) {
+             auto tableIt = listener.tables.find(msgType);
+             if(tableIt != listener.tables.end()) {
+               auto& table = tableIt->second;
+               std::ranges::sort(listener.hrPoints, {}, &HrPoint::timestamp);
+               auto& hrColumn = table.columns["heart_rate"];
+               for(size_t row = 0; row < table.rowCount; ++row) {
+                 while(hrColumn.committedRows < row)
+                   hrColumn.add(Symbol("NULL"));
+                 double ts = (row < listener.rowTimestamps.size()) ? listener.rowTimestamps[row]
+                                                                   : -1.0;
+                 if(ts < 0.0) {
+                   hrColumn.add(Symbol("NULL"));
+                   continue;
+                 }
+                 auto it = std::ranges::lower_bound(listener.hrPoints, ts, {},
+                                                    &HrPoint::timestamp);
+                 double bpm;
+                 if(it == listener.hrPoints.end())
+                   bpm = listener.hrPoints.back().bpm;
+                 else if(it == listener.hrPoints.begin())
+                   bpm = it->bpm;
+                 else {
+                   auto prev = std::prev(it);
+                   bpm = (ts - prev->timestamp <= it->timestamp - ts) ? prev->bpm : it->bpm;
+                 }
+                 hrColumn.add(bpm);
+               }
+               while(hrColumn.committedRows < table.rowCount)
+                 hrColumn.add(Symbol("NULL"));
              }
            }
 
