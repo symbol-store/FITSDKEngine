@@ -88,7 +88,7 @@ if(MSVC)
 else()
   set(LibraryType MODULE)
 endif(MSVC)
-add_library(FITSDKEngine ${LibraryType} Source/FITSDKEngine.cpp ${FITSDK_SOURCE_FILES})
+add_library(FITSDKEngine ${LibraryType} Source/FITSDKEngine.cpp Source/fit_skip.cpp ${FITSDK_SOURCE_FILES})
 
 set_property(TARGET FITSDKEngine PROPERTY CXX_STANDARD 23)
 if(MSVC)
