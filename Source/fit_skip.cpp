@@ -36,25 +36,17 @@ static constexpr uint32_t kFitEpochOffset = 631065600u;
 // Called only at definition-bind time; linear scans are acceptable.
 
 static std::string_view profile_msg_name(uint16_t global_msg_num) noexcept {
-  for(FIT_UINT16 i = 0; i < fit::Profile::NumMesgs; ++i) {
-    if(fit::Profile::mesgs[i].num == global_msg_num)
-      return fit::Profile::mesgs[i].name ? fit::Profile::mesgs[i].name
-                                         : std::string_view{};
-  }
-  return {};
+  const auto* m = fit::Profile::GetMesg(global_msg_num);
+  return m ? std::string_view{m->name} : std::string_view{};
 }
 
 static std::string_view profile_field_name(uint16_t global_msg_num,
                                             uint8_t  field_def_num) noexcept {
-  for(FIT_UINT16 i = 0; i < fit::Profile::NumMesgs; ++i) {
-    if(fit::Profile::mesgs[i].num != global_msg_num)
-      continue;
-    const auto& m = fit::Profile::mesgs[i];
-    for(FIT_UINT16 j = 0; j < m.numFields; ++j)
-      if(m.fields[j].num == field_def_num)
-        return m.fields[j].name ? m.fields[j].name : std::string_view{};
-    break;
-  }
+  const auto* m = fit::Profile::GetMesg(global_msg_num);
+  if(!m) return {};
+  for(FIT_UINT16 j = 0; j < m->numFields; ++j)
+    if(m->fields[j].num == field_def_num)
+      return m->fields[j].name;
   return {};
 }
 
