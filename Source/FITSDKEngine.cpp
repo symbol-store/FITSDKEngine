@@ -243,12 +243,12 @@ struct MessageTable {
 // Each flag is passed as a ComplexExpression: "flag_name"_(0_or_1).
 // Omitting a flag leaves its default in effect.
 struct ParseFlags {
-  bool apply_scale_and_offset = true;   // use GetFLOAT64Value (scaled); false → GetRawValue
-  bool expand_components = true;        // let Decode expand component fields
-  bool expand_sub_fields = true;        // expose active sub-field as a separate column
+  bool apply_scale_and_offset = true;     // use GetFLOAT64Value (scaled); false → GetRawValue
+  bool expand_components = true;          // let Decode expand component fields
+  bool expand_sub_fields = true;          // expose active sub-field as a separate column
   bool convert_datetimes_to_dates = true; // shift FIT timestamps to Unix epoch
-  bool merge_heart_rates = false;       // interpolate HR from hr messages into target table
-  bool enable_crc_check = true;         // validate file CRC; false → SkipHeader
+  bool merge_heart_rates = false;         // interpolate HR from hr messages into target table
+  bool enable_crc_check = true;           // validate file CRC; false → SkipHeader
 };
 
 // Seconds between the FIT epoch (Dec 31 1989 00:00 UTC) and the Unix epoch.
@@ -270,11 +270,11 @@ struct HrPoint {
 
 static Expression evaluate(Expression&& e) {
   using sentinel::Any_;
-  using sentinel::Symbol_;
   using sentinel::AnySequence_;
+  using sentinel::Symbol_;
   return std::move(e) //
          <"LoadFIT"_(Any_, Symbol_, AnySequence_) >= Recurse(evaluate)>[](auto, auto dynamics,
-                                                                           auto) -> Expression {
+                                                                          auto) -> Expression {
            auto const& path = std::get<std::string>(dynamics.at(0));
            auto const& msgType = std::get<Symbol>(dynamics.at(1)).getName();
 
@@ -443,14 +443,13 @@ static Expression evaluate(Expression&& e) {
                for(size_t row = 0; row < table.rowCount; ++row) {
                  while(hrColumn.committedRows < row)
                    hrColumn.add(Symbol("NULL"));
-                 double ts = (row < listener.rowTimestamps.size()) ? listener.rowTimestamps[row]
-                                                                   : -1.0;
+                 double ts =
+                     (row < listener.rowTimestamps.size()) ? listener.rowTimestamps[row] : -1.0;
                  if(ts < 0.0) {
                    hrColumn.add(Symbol("NULL"));
                    continue;
                  }
-                 auto it = std::ranges::lower_bound(listener.hrPoints, ts, {},
-                                                    &HrPoint::timestamp);
+                 auto it = std::ranges::lower_bound(listener.hrPoints, ts, {}, &HrPoint::timestamp);
                  double bpm;
                  if(it == listener.hrPoints.end())
                    bpm = listener.hrPoints.back().bpm;
@@ -477,7 +476,47 @@ static Expression evaluate(Expression&& e) {
                  ComplexExpression(Symbol(name), {}, {}, std::move(column).build()));
 
            return ComplexExpression(Symbol("Table"), {}, std::move(columns), {});
-         } < Any_ >= Recurse(evaluate);
+         } < "GetEngineDescription"_() >= [](auto, auto dynamics, auto) -> Expression {
+           return R"(
+**Loading FIT workout data:**
+- `(LoadFIT "/path/to/dir")` - summary table, one row per `.fit` file; columns: `file`, `time_created`, `start_time`, `sport`, `total_elapsed_time` (seconds), `total_distance` (metres), `total_calories`
+- `(LoadFIT "/path/to/file.fit" msgtype)` - single file with message type
+- `(LoadFIT "/path/to/dir" msgtype)` - all files in directory with message type
+
+Message types (Garmin FIT protocol spec columns):
+- `session` - one row per workout; per-workout aggregates: `avg/max_heart_rate`, `avg/max_speed`, `avg/max_power`, `avg_cadence`, `total_calories`, `total_distance`, `total_elapsed_time`, `total_ascent`, `num_laps`, GPS bounding box, `training_load_peak`, `sport`, `timestamp`, etc.
+- `record` - one row per second; time-series GPS/sensor data: `timestamp`, `position_lat/long`, `altitude`, `heart_rate`, `cadence`, `speed`, `power`, `distance`, etc. **Large - use only for single-file analysis.**
+- `lap` - per-lap summaries
+- `activity` - activity-level metadata
+
+**Path conventions:** Paths must be absolute. `~` is not expanded (BOSS does not invoke shell expansion). Use `/Users/<name>/...` on macOS, `/home/<name>/...` on Linux.
+
+             **Unicode in filenames:** Raw UTF-8 and JSON `\uXXXX` escapes are both accepted and equivalent - use whichever your client emits naturally. The real hazard is *invisible* Unicode: filenames produced by Apple devices commonly contain U+00A0 (non-breaking space) where a regular space appears to be - for instance, between "Apple" and "Watch" in Apple Watch export filenames. NBSP renders identically to a regular space everywhere, including in the `file` column returned by the directory-summary query, so it cannot be detected by sight. If `LoadFIT` reports `cannot open file` on a path that *visually* matches the directory listing, write the suspect gaps explicitly as `\u00a0` and retry. The same caution applies to U+200B (zero-width space), U+00AD (soft hyphen), and the Unicode dash variants. Discover the row with `(Slice (OrderBy (LoadFIT ".../dir") (List (Desc time_created))) 0 1)`.
+
+**Key patterns:**
+```
+; Most recent N workouts
+(Slice (OrderBy (LoadFIT ".../dir") (List (Desc time_created))) 0 5)
+
+; Per-sport average of a derived metric (derive first, then aggregate)
+(GroupBy
+  (Project (LoadFIT ".../dir")
+    (As (Divide total_calories (Divide total_elapsed_time 60.0)) cal_per_min)
+    sport)
+  (Mean cal_per_min)
+  sport)
+
+; Cache a large load for reuse across calls
+(Name (LoadFIT ".../dir" session) workouts)
+(GroupBy (ByName workouts) (Mean total_calories) sport)
+```
+
+**Avoid returning unaggregated full-directory loads** — they exceed the result size limit. Always wrap in `GroupBy`, `Slice`, or `Filter` before returning.
+)";
+         } //
+                                                                               < Any_ >=
+                                                                               Recurse(evaluate) //
+      ;
 };
 
 extern "C" BOSSExpression* evaluate(BOSSExpression* e) {
