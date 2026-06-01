@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <variant>
@@ -476,7 +477,165 @@ static Expression evaluate(Expression&& e) {
                  ComplexExpression(Symbol(name), {}, {}, std::move(column).build()));
 
            return ComplexExpression(Symbol("Table"), {}, std::move(columns), {});
-         } < "GetEngineDescription"_() >= [](auto, auto dynamics, auto) -> Expression {
+         } <"LoadFIT"_(Any_, AnySequence_) >= Recurse(evaluate)>[](auto, auto dynamics,
+                                                                   auto) -> Expression {
+           // No message-type Symbol at position 1: emit a per-file summary table.
+           auto const& path = std::get<std::string>(dynamics.at(0));
+
+           ParseFlags flags;
+           for(size_t i = 1; i < dynamics.size(); ++i) {
+             auto* flagExpr = std::get_if<ComplexExpression>(&dynamics[i]);
+             if(!flagExpr)
+               continue;
+             auto [flagHead, flagStatics, flagArgs, flagSpans] = std::move(*flagExpr).decompose();
+             bool value = true;
+             if(!flagArgs.empty()) {
+               if(auto* iv = std::get_if<int64_t>(&flagArgs[0]))
+                 value = (*iv != 0);
+               else if(auto* dv = std::get_if<double>(&flagArgs[0]))
+                 value = (*dv != 0.0);
+             }
+             auto const& flagName = flagHead.getName();
+             if(flagName == "apply_scale_and_offset")
+               flags.apply_scale_and_offset = value;
+             else if(flagName == "expand_components")
+               flags.expand_components = value;
+             else if(flagName == "expand_sub_fields")
+               flags.expand_sub_fields = value;
+             else if(flagName == "convert_datetimes_to_dates")
+               flags.convert_datetimes_to_dates = value;
+             else if(flagName == "merge_heart_rates")
+               flags.merge_heart_rates = value;
+             else if(flagName == "enable_crc_check")
+               flags.enable_crc_check = value;
+           }
+
+           auto filePaths = std::vector<std::filesystem::path> {};
+           if(std::filesystem::is_directory(path)) {
+             for(auto const& entry : std::filesystem::directory_iterator(path))
+               if(entry.path().extension() == ".fit")
+                 filePaths.push_back(entry.path());
+             std::ranges::sort(filePaths);
+           } else {
+             filePaths.push_back(path);
+           }
+
+           struct : fit::MesgListener {
+             ParseFlags flags;
+             bool fileIdSeen = false;
+             bool sessionSeen = false;
+             std::optional<double> timeCreated;
+             std::optional<double> startTime;
+             std::optional<Symbol> sport;
+             std::optional<double> totalElapsedTime;
+             std::optional<double> totalDistance;
+             std::optional<double> totalCalories;
+
+             void reset() {
+               fileIdSeen = false;
+               sessionSeen = false;
+               timeCreated.reset();
+               startTime.reset();
+               sport.reset();
+               totalElapsedTime.reset();
+               totalDistance.reset();
+               totalCalories.reset();
+             }
+
+             std::optional<double> readDouble(fit::Mesg& mesg, char const* name) {
+               auto* field = mesg.GetField(name);
+               if(!field || !field->IsValueValid())
+                 return std::nullopt;
+               double value = flags.apply_scale_and_offset ? field->GetFLOAT64Value()
+                                                           : field->GetRawValue();
+               if(flags.convert_datetimes_to_dates && isDateTimeField(name) &&
+                  value >= kFitDateTimeMin)
+                 value += kFitEpochOffset;
+               return value;
+             }
+
+             void OnMesg(fit::Mesg& mesg) override {
+               if(mesg.GetName() == "file_id" && !fileIdSeen) {
+                 timeCreated = readDouble(mesg, "time_created");
+                 fileIdSeen = true;
+               } else if(mesg.GetName() == "session" && !sessionSeen) {
+                 startTime = readDouble(mesg, "start_time");
+                 auto* sportField = mesg.GetField("sport");
+                 if(sportField && sportField->IsValueValid())
+                   sport = fitSportName(static_cast<int>(sportField->GetFLOAT64Value()));
+                 totalElapsedTime = readDouble(mesg, "total_elapsed_time");
+                 totalDistance = readDouble(mesg, "total_distance");
+                 totalCalories = readDouble(mesg, "total_calories");
+                 sessionSeen = true;
+               }
+             }
+           } summaryListener;
+           summaryListener.flags = flags;
+
+           ColumnBuilder fileColumn;
+           ColumnBuilder timeCreatedColumn;
+           ColumnBuilder startTimeColumn;
+           ColumnBuilder sportColumn;
+           ColumnBuilder totalElapsedTimeColumn;
+           ColumnBuilder totalDistanceColumn;
+           ColumnBuilder totalCaloriesColumn;
+
+           auto addOptionalDouble = [](ColumnBuilder& column,
+                                       std::optional<double> value) {
+             if(value)
+               column.add(*value);
+             else
+               column.add(Symbol("NULL"));
+           };
+
+           for(auto const& filePath : filePaths) {
+             auto file = std::fstream(filePath, std::ios::in | std::ios::binary);
+             if(!file.is_open())
+               return "LoadFIT::error: cannot open file: "s + filePath.string();
+             summaryListener.reset();
+             try {
+               fit::Decode decode;
+               if(!flags.expand_components)
+                 decode.SuppressComponentExpansion();
+               if(!flags.enable_crc_check)
+                 decode.SkipHeader();
+               decode.Read(file, summaryListener);
+             } catch(fit::RuntimeException const& e) {
+               return "LoadFIT::error: "s + e.what();
+             } catch(...) {
+               return "LoadFIT::error: unknown exception during decode"s;
+             }
+
+             fileColumn.add(filePath.filename().string());
+             addOptionalDouble(timeCreatedColumn, summaryListener.timeCreated);
+             addOptionalDouble(startTimeColumn, summaryListener.startTime);
+             if(summaryListener.sport)
+               sportColumn.add(*summaryListener.sport);
+             else
+               sportColumn.add(Symbol("NULL"));
+             addOptionalDouble(totalElapsedTimeColumn, summaryListener.totalElapsedTime);
+             addOptionalDouble(totalDistanceColumn, summaryListener.totalDistance);
+             addOptionalDouble(totalCaloriesColumn, summaryListener.totalCalories);
+           }
+
+           auto columns = ExpressionArguments {};
+           columns.emplace_back(
+               ComplexExpression(Symbol("file"), {}, {}, std::move(fileColumn).build()));
+           columns.emplace_back(ComplexExpression(Symbol("time_created"), {}, {},
+                                                  std::move(timeCreatedColumn).build()));
+           columns.emplace_back(ComplexExpression(Symbol("start_time"), {}, {},
+                                                  std::move(startTimeColumn).build()));
+           columns.emplace_back(
+               ComplexExpression(Symbol("sport"), {}, {}, std::move(sportColumn).build()));
+           columns.emplace_back(ComplexExpression(Symbol("total_elapsed_time"), {}, {},
+                                                  std::move(totalElapsedTimeColumn).build()));
+           columns.emplace_back(ComplexExpression(Symbol("total_distance"), {}, {},
+                                                  std::move(totalDistanceColumn).build()));
+           columns.emplace_back(ComplexExpression(Symbol("total_calories"), {}, {},
+                                                  std::move(totalCaloriesColumn).build()));
+
+           return ComplexExpression(Symbol("Table"), {}, std::move(columns), {});
+                  } < "GetEngineDescription"_() >= [](auto, auto dynamics, auto) -> Expression {
            return R"(
 **Loading FIT workout data:**
 - `(LoadFIT "/path/to/dir")` - summary table, one row per `.fit` file; columns: `file`, `time_created`, `start_time`, `sport`, `total_elapsed_time` (seconds), `total_distance` (metres), `total_calories`
