@@ -240,7 +240,7 @@ struct MessageTable {
   std::map<std::string, ColumnBuilder> columns;
 };
 
-// Parsing options exposed as symbolic flags on the LoadFIT operator.
+// Parsing options exposed as symbolic flags on the Load operator.
 // Each flag is passed as a ComplexExpression: "flag_name"_(0_or_1).
 // Omitting a flag leaves its default in effect.
 struct ParseFlags {
@@ -300,17 +300,32 @@ static ParseFlags parseFlagsFrom(ExpressionArguments& dynamics, size_t startInde
   return flags;
 }
 
-static std::vector<std::filesystem::path> resolveFITPaths(std::string const& path) {
-  std::vector<std::filesystem::path> filePaths;
-  if(std::filesystem::is_directory(path)) {
-    for(auto const& entry : std::filesystem::directory_iterator(path))
+struct LoadPlan {
+  std::vector<std::filesystem::path> fitFiles;
+  bool hasOtherFiles = false;
+};
+
+static LoadPlan planLoad(std::string const& path) {
+  LoadPlan plan;
+  std::error_code ec;
+  std::filesystem::path p(path);
+  if(std::filesystem::is_directory(p, ec)) {
+    for(auto const& entry : std::filesystem::directory_iterator(p, ec)) {
       if(entry.path().extension() == ".fit")
-        filePaths.push_back(entry.path());
-    std::ranges::sort(filePaths);
-  } else {
-    filePaths.push_back(path);
+        plan.fitFiles.push_back(entry.path());
+      else
+        plan.hasOtherFiles = true;
+    }
+    std::ranges::sort(plan.fitFiles);
+    return plan;
   }
-  return filePaths;
+  if(p.extension() == ".fit")
+    plan.fitFiles.push_back(p);
+  return plan;
+}
+
+static Expression wrapForMixedDirectory(std::string path, Expression fitTable) {
+  return "Union"_("Load"_(std::move(path)), std::move(fitTable));
 }
 
 static Expression evaluate(Expression&& e) {
@@ -318,14 +333,16 @@ static Expression evaluate(Expression&& e) {
   using sentinel::AnySequence_;
   using sentinel::Symbol_;
   return std::move(e) //
-         <"LoadFIT"_(Any_, Symbol_, AnySequence_) >= Recurse(evaluate)>[](auto, auto dynamics,
-                                                                          auto) -> Expression {
+         <"Load"_(Any_, Symbol_, AnySequence_) >= Recurse(evaluate)>[](auto, auto dynamics,
+                                                                       auto) -> Expression {
            auto const& path = std::get<std::string>(dynamics.at(0));
+           auto plan = planLoad(path);
+           if(plan.fitFiles.empty())
+             return "Load"_(std::move(dynamics));
+
            auto const& msgType = std::get<Symbol>(dynamics.at(1)).getName();
-
            auto flags = parseFlagsFrom(dynamics, 2);
-           auto filePaths = resolveFITPaths(path);
-
+           auto filePaths = std::move(plan.fitFiles);
 
            struct : fit::MesgListener {
              std::string_view targetType;
@@ -427,7 +444,7 @@ static Expression evaluate(Expression&& e) {
            for(auto const& filePath : filePaths) {
              auto file = std::fstream(filePath, std::ios::in | std::ios::binary);
              if(!file.is_open())
-               return "LoadFIT::error: cannot open file: "s + filePath.string();
+               return "Load::error: cannot open file: "s + filePath.string();
              try {
                fit::Decode decode;
                if(!flags.expand_components)
@@ -436,9 +453,9 @@ static Expression evaluate(Expression&& e) {
                  decode.SkipHeader();
                decode.Read(file, listener);
              } catch(fit::RuntimeException const& e) {
-               return "LoadFIT::error: "s + e.what();
+               return "Load::error: "s + e.what();
              } catch(...) {
-               return "LoadFIT::error: unknown exception during decode"s;
+               return "Load::error: unknown exception during decode"s;
              }
            }
 
@@ -477,19 +494,26 @@ static Expression evaluate(Expression&& e) {
 
            auto tableEntry = listener.tables.find(msgType);
            if(tableEntry == listener.tables.end())
-             return "LoadFIT::error: message type not found: "s + msgType;
+             return "Load::error: message type not found: "s + msgType;
 
            auto columns = ExpressionArguments {};
            for(auto& [name, column] : tableEntry->second.columns)
              columns.emplace_back(
                  ComplexExpression(Symbol(name), {}, {}, std::move(column).build()));
 
-           return ComplexExpression(Symbol("Table"), {}, std::move(columns), {});
-         } <"LoadFIT"_(Any_, AnySequence_) >= Recurse(evaluate)>[](auto, auto dynamics,
+           auto table = "Table"_(std::move(columns));
+           if(plan.hasOtherFiles)
+             return wrapForMixedDirectory(std::string(path), std::move(table));
+           return std::move(table);
+         } < "Load"_(Any_, AnySequence_) >= Recurse(evaluate) > [](auto, auto dynamics,
                                                                    auto) -> Expression {
            auto const& path = std::get<std::string>(dynamics.at(0));
+           auto plan = planLoad(path);
+           if(plan.fitFiles.empty())
+             return "Load"_(std::move(dynamics));
+
            auto flags = parseFlagsFrom(dynamics, 1);
-           auto filePaths = resolveFITPaths(path);
+           auto filePaths = std::move(plan.fitFiles);
 
            struct SummaryListener : fit::MesgListener {
              ParseFlags flags;
@@ -507,8 +531,8 @@ static Expression evaluate(Expression&& e) {
                auto* field = mesg.GetField(name);
                if(!field || !field->IsValueValid())
                  return std::nullopt;
-               double value = flags.apply_scale_and_offset ? field->GetFLOAT64Value()
-                                                           : field->GetRawValue();
+               double value =
+                   flags.apply_scale_and_offset ? field->GetFLOAT64Value() : field->GetRawValue();
                if(flags.convert_datetimes_to_dates && isDateTimeField(name) &&
                   value >= kFitDateTimeMin)
                  value += kFitEpochOffset;
@@ -543,18 +567,22 @@ static Expression evaluate(Expression&& e) {
            ColumnBuilder totalCaloriesColumn;
 
            auto addOptionalDouble = [](ColumnBuilder& column, std::optional<double> value) {
-             if(value) column.add(*value);
-             else column.add(Symbol("NULL"));
+             if(value)
+               column.add(*value);
+             else
+               column.add(Symbol("NULL"));
            };
            auto addOptionalSymbol = [](ColumnBuilder& column, std::optional<Symbol> value) {
-             if(value) column.add(*value);
-             else column.add(Symbol("NULL"));
+             if(value)
+               column.add(*value);
+             else
+               column.add(Symbol("NULL"));
            };
 
            for(auto const& filePath : filePaths) {
              auto file = std::fstream(filePath, std::ios::in | std::ios::binary);
              if(!file.is_open())
-               return "LoadFIT::error: cannot open file: "s + filePath.string();
+               return "Load::error: cannot open file: "s + filePath.string();
              SummaryListener summaryListener;
              summaryListener.flags = flags;
              try {
@@ -566,9 +594,9 @@ static Expression evaluate(Expression&& e) {
                  decode.SkipHeader();
                decode.Read(file, summaryListener);
              } catch(fit::RuntimeException const& e) {
-               return "LoadFIT::error: "s + e.what();
+               return "Load::error: "s + e.what();
              } catch(...) {
-               return "LoadFIT::error: unknown exception during decode"s;
+               return "Load::error: unknown exception during decode"s;
              }
 
              fileColumn.add(filePath.filename().string());
@@ -585,8 +613,8 @@ static Expression evaluate(Expression&& e) {
                ComplexExpression(Symbol("file"), {}, {}, std::move(fileColumn).build()));
            columns.emplace_back(ComplexExpression(Symbol("time_created"), {}, {},
                                                   std::move(timeCreatedColumn).build()));
-           columns.emplace_back(ComplexExpression(Symbol("start_time"), {}, {},
-                                                  std::move(startTimeColumn).build()));
+           columns.emplace_back(
+               ComplexExpression(Symbol("start_time"), {}, {}, std::move(startTimeColumn).build()));
            columns.emplace_back(
                ComplexExpression(Symbol("sport"), {}, {}, std::move(sportColumn).build()));
            columns.emplace_back(ComplexExpression(Symbol("total_elapsed_time"), {}, {},
@@ -596,13 +624,18 @@ static Expression evaluate(Expression&& e) {
            columns.emplace_back(ComplexExpression(Symbol("total_calories"), {}, {},
                                                   std::move(totalCaloriesColumn).build()));
 
-           return ComplexExpression(Symbol("Table"), {}, std::move(columns), {});
+           auto table = "Table"_(std::move(columns));
+           if(plan.hasOtherFiles)
+             return wrapForMixedDirectory(std::string(path), std::move(table));
+           return std::move(table);
          } < "GetEngineDescription"_() >= [](auto, auto dynamics, auto) -> Expression {
            return R"(
 **Loading FIT workout data:**
-- `(LoadFIT "/path/to/dir")` - summary table, one row per `.fit` file; columns: `file`, `time_created`, `start_time`, `sport`, `total_elapsed_time` (seconds), `total_distance` (metres), `total_calories`
-- `(LoadFIT "/path/to/file.fit" msgtype)` - single file with message type
-- `(LoadFIT "/path/to/dir" msgtype)` - all files in directory with message type
+- `(Load "/path/to/dir")` - summary table, one row per `.fit` file; columns: `file`, `time_created`, `start_time`, `sport`, `total_elapsed_time` (seconds), `total_distance` (metres), `total_calories`
+- `(Load "/path/to/file.fit" msgtype)` - single file with message type
+- `(Load "/path/to/dir" msgtype)` - all files in directory with message type
+
+**Mixed-content directories:** If the directory also contains non-`.fit` files, the FIT engine loads the `.fit` subset and emits `(Union (Load "/path/to/dir") (Table ...))` so another engine can pick up the rest. A single non-`.fit` path or a directory with no `.fit` files is returned unchanged as `(Load ...)` for another engine to handle.
 
 Message types (Garmin FIT protocol spec columns):
 - `session` - one row per workout; per-workout aggregates: `avg/max_heart_rate`, `avg/max_speed`, `avg/max_power`, `avg_cadence`, `total_calories`, `total_distance`, `total_elapsed_time`, `total_ascent`, `num_laps`, GPS bounding box, `training_load_peak`, `sport`, `timestamp`, etc.
@@ -612,23 +645,23 @@ Message types (Garmin FIT protocol spec columns):
 
 **Path conventions:** Paths must be absolute. `~` is not expanded (BOSS does not invoke shell expansion). Use `/Users/<name>/...` on macOS, `/home/<name>/...` on Linux.
 
-             **Unicode in filenames:** Raw UTF-8 and JSON `\uXXXX` escapes are both accepted and equivalent - use whichever your client emits naturally. The real hazard is *invisible* Unicode: filenames produced by Apple devices commonly contain U+00A0 (non-breaking space) where a regular space appears to be - for instance, between "Apple" and "Watch" in Apple Watch export filenames. NBSP renders identically to a regular space everywhere, including in the `file` column returned by the directory-summary query, so it cannot be detected by sight. If `LoadFIT` reports `cannot open file` on a path that *visually* matches the directory listing, write the suspect gaps explicitly as `\u00a0` and retry. The same caution applies to U+200B (zero-width space), U+00AD (soft hyphen), and the Unicode dash variants. Discover the row with `(Slice (OrderBy (LoadFIT ".../dir") (List (Desc time_created))) 0 1)`.
+             **Unicode in filenames:** Raw UTF-8 and JSON `\uXXXX` escapes are both accepted and equivalent - use whichever your client emits naturally. The real hazard is *invisible* Unicode: filenames produced by Apple devices commonly contain U+00A0 (non-breaking space) where a regular space appears to be - for instance, between "Apple" and "Watch" in Apple Watch export filenames. NBSP renders identically to a regular space everywhere, including in the `file` column returned by the directory-summary query, so it cannot be detected by sight. If `Load` reports `cannot open file` on a path that *visually* matches the directory listing, write the suspect gaps explicitly as `\u00a0` and retry. The same caution applies to U+200B (zero-width space), U+00AD (soft hyphen), and the Unicode dash variants. Discover the row with `(Slice (OrderBy (Load ".../dir") (List (Desc time_created))) 0 1)`.
 
 **Key patterns:**
 ```
 ; Most recent N workouts
-(Slice (OrderBy (LoadFIT ".../dir") (List (Desc time_created))) 0 5)
+(Slice (OrderBy (Load ".../dir") (List (Desc time_created))) 0 5)
 
 ; Per-sport average of a derived metric (derive first, then aggregate)
 (GroupBy
-  (Project (LoadFIT ".../dir")
+  (Project (Load ".../dir")
     (As (Divide total_calories (Divide total_elapsed_time 60.0)) cal_per_min)
     sport)
   (Mean cal_per_min)
   sport)
 
 ; Cache a large load for reuse across calls
-(Name (LoadFIT ".../dir" session) workouts)
+(Name (Load ".../dir" session) workouts)
 (GroupBy (ByName workouts) (Mean total_calories) sport)
 ```
 
