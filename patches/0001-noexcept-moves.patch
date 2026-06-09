@@ -1,0 +1,36 @@
+--- a/src/fit_field_base.hpp
++++ b/src/fit_field_base.hpp
+@@ -28,6 +28,9 @@
+ public:
+     FieldBase(void);
+     FieldBase(const FieldBase& other);
++    FieldBase(FieldBase&& other) noexcept = default;
++    FieldBase& operator=(const FieldBase&) = default;
++    FieldBase& operator=(FieldBase&&) noexcept = default;
+     virtual ~FieldBase();
+ 
+     std::string GetName(const FIT_UINT16 subFieldIndex) const;
+--- a/src/fit_field.hpp
++++ b/src/fit_field.hpp
+@@ -30,6 +30,9 @@
+ public:
+     Field(void);
+     Field(const Field &field);
++    Field(Field&& field) noexcept = default;
++    Field& operator=(const Field&) = default;
++    Field& operator=(Field&&) noexcept = default;
+     Field(const Profile::MESG_INDEX mesgIndex, const FIT_UINT16 fieldIndex);
+     Field(const FIT_UINT16 mesgNum, const FIT_UINT8 fieldNum);
+     Field(const std::string& mesgName, const std::string& fieldName);
+--- a/src/fit_mesg.hpp
++++ b/src/fit_mesg.hpp
+@@ -31,6 +31,9 @@
+ public:
+     Mesg(void);
+     Mesg(const Mesg &mesg);
++    Mesg(Mesg&& mesg) noexcept = default;
++    Mesg& operator=(const Mesg&) = default;
++    Mesg& operator=(Mesg&&) noexcept = default;
+     Mesg(const Profile::MESG_INDEX index);
+     Mesg(const std::string& name);
+     Mesg(const FIT_UINT16 num);
