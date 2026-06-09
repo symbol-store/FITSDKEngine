@@ -11,11 +11,13 @@
 #include "fit_runtime_exception.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -229,6 +231,21 @@ struct ColumnBuilder {
     committedRows++;
   }
 
+  void appendFrom(ColumnBuilder&& other) {
+    other.flush();
+    spans.reserve(spans.size() + other.spans.size());
+    for(auto& s : other.spans)
+      spans.push_back(std::move(s));
+    committedRows += other.committedRows;
+  }
+
+  void appendNulls(size_t n) {
+    if(n == 0) return;
+    flush();
+    spans.push_back(Span<Symbol>(std::vector<Symbol>(n, Symbol("NULL"))));
+    committedRows += n;
+  }
+
   ExpressionSpanArguments build() && {
     flush();
     return std::move(spans);
@@ -344,7 +361,7 @@ static Expression evaluate(Expression&& e) {
            auto flags = parseFlagsFrom(dynamics, 2);
            auto filePaths = std::move(plan.fitFiles);
 
-           struct : fit::MesgListener {
+           struct FitDataListener : fit::MesgListener {
              std::string_view targetType;
              ParseFlags flags;
              std::unordered_map<std::string, MessageTable> tables;
@@ -437,49 +454,125 @@ static Expression evaluate(Expression&& e) {
                  if(column.committedRows < table.rowCount)
                    column.add(Symbol("NULL"));
              }
-           } listener;
-           listener.targetType = msgType;
-           listener.flags = flags;
+           };
 
-           for(auto const& filePath : filePaths) {
-             auto file = std::fstream(filePath, std::ios::in | std::ios::binary);
-             if(!file.is_open())
-               return "Load::error: cannot open file: "s + filePath.string();
-             try {
-               fit::Decode decode;
-               if(!flags.expand_components)
-                 decode.SuppressComponentExpansion();
-               if(!flags.enable_crc_check)
-                 decode.SkipHeader();
-               decode.Read(file, listener);
-             } catch(fit::RuntimeException const& e) {
-               return "Load::error: "s + e.what();
-             } catch(...) {
-               return "Load::error: unknown exception during decode"s;
+           unsigned int hwc = std::thread::hardware_concurrency();
+           if(hwc == 0) hwc = 1;
+           unsigned int numWorkers =
+               std::min<unsigned int>(hwc, static_cast<unsigned int>(filePaths.size()));
+
+           std::vector<FitDataListener> listeners(numWorkers);
+           for(auto& l : listeners) {
+             l.targetType = msgType;
+             l.flags = flags;
+           }
+           std::vector<std::optional<std::string>> workerErrors(numWorkers);
+
+           {
+             std::atomic<size_t> nextFileIdx{0};
+             std::vector<std::thread> workers;
+             workers.reserve(numWorkers);
+             for(unsigned int w = 0; w < numWorkers; ++w) {
+               workers.emplace_back([&, w]() {
+                 auto& listener = listeners[w];
+                 size_t i;
+                 while((i = nextFileIdx.fetch_add(1, std::memory_order_relaxed)) <
+                       filePaths.size()) {
+                   auto const& filePath = filePaths[i];
+                   auto file = std::fstream(filePath, std::ios::in | std::ios::binary);
+                   if(!file.is_open()) {
+                     workerErrors[w] = "Load::error: cannot open file: "s + filePath.string();
+                     return;
+                   }
+                   try {
+                     fit::Decode decode;
+                     if(!flags.expand_components)
+                       decode.SuppressComponentExpansion();
+                     if(!flags.enable_crc_check)
+                       decode.SkipHeader();
+                     decode.Read(file, listener);
+                   } catch(fit::RuntimeException const& e) {
+                     workerErrors[w] = "Load::error: "s + e.what();
+                     return;
+                   } catch(...) {
+                     workerErrors[w] = "Load::error: unknown exception during decode"s;
+                     return;
+                   }
+                 }
+               });
+             }
+             for(auto& t : workers) t.join();
+           }
+
+           for(auto& e : workerErrors)
+             if(e) return *e;
+
+           // std::map keeps the column order alphabetical, matching single-listener output.
+           std::map<std::string, ColumnBuilder> mergedColumns;
+           size_t mergedRowCount = 0;
+           auto msgTypeKey = std::string(msgType);
+           for(auto& l : listeners) {
+             auto it = l.tables.find(msgTypeKey);
+             if(it == l.tables.end()) continue;
+             mergedRowCount += it->second.rowCount;
+             for(auto const& [name, _] : it->second.columns) {
+               // Skip native heart_rate when interpolating — HR merge will write the column.
+               if(flags.merge_heart_rates && name == "heart_rate") continue;
+               mergedColumns.try_emplace(name);
+             }
+           }
+           for(auto& l : listeners) {
+             auto it = l.tables.find(msgTypeKey);
+             if(it == l.tables.end()) continue;
+             size_t lRows = it->second.rowCount;
+             for(auto& [name, target] : mergedColumns) {
+               auto colIt = it->second.columns.find(name);
+               if(colIt != it->second.columns.end())
+                 target.appendFrom(std::move(colIt->second));
+               else
+                 target.appendNulls(lRows);
              }
            }
 
+           if(mergedRowCount == 0)
+             return "Load::error: message type not found: "s + msgTypeKey;
+
            // Merge heart rate data: nearest-neighbour interpolation by timestamp.
-           if(flags.merge_heart_rates && !listener.hrPoints.empty()) {
-             auto tableIt = listener.tables.find(msgType);
-             if(tableIt != listener.tables.end()) {
-               auto& table = tableIt->second;
-               std::ranges::sort(listener.hrPoints, {}, &HrPoint::timestamp);
-               auto& hrColumn = table.columns["heart_rate"];
-               for(size_t row = 0; row < table.rowCount; ++row) {
-                 while(hrColumn.committedRows < row)
-                   hrColumn.add(Symbol("NULL"));
+           // rowTimestamps stays row-aligned with mergedColumns only because each
+           // listener appends its rows contiguously in the same worker-iteration order
+           // used here — keep those two loops in lockstep.
+           if(flags.merge_heart_rates) {
+             size_t hrPointTotal = 0, rowTsTotal = 0;
+             for(auto& l : listeners) {
+               hrPointTotal += l.hrPoints.size();
+               rowTsTotal += l.rowTimestamps.size();
+             }
+             std::vector<HrPoint> mergedHrPoints;
+             std::vector<double> mergedRowTimestamps;
+             mergedHrPoints.reserve(hrPointTotal);
+             mergedRowTimestamps.reserve(rowTsTotal);
+             for(auto& l : listeners) {
+               mergedHrPoints.insert(mergedHrPoints.end(),
+                                     l.hrPoints.begin(), l.hrPoints.end());
+               mergedRowTimestamps.insert(mergedRowTimestamps.end(),
+                                          l.rowTimestamps.begin(), l.rowTimestamps.end());
+             }
+             if(!mergedHrPoints.empty()) {
+               std::ranges::sort(mergedHrPoints, {}, &HrPoint::timestamp);
+               ColumnBuilder hrColumn;
+               for(size_t row = 0; row < mergedRowCount; ++row) {
                  double ts =
-                     (row < listener.rowTimestamps.size()) ? listener.rowTimestamps[row] : -1.0;
+                     (row < mergedRowTimestamps.size()) ? mergedRowTimestamps[row] : -1.0;
                  if(ts < 0.0) {
                    hrColumn.add(Symbol("NULL"));
                    continue;
                  }
-                 auto it = std::ranges::lower_bound(listener.hrPoints, ts, {}, &HrPoint::timestamp);
+                 auto it =
+                     std::ranges::lower_bound(mergedHrPoints, ts, {}, &HrPoint::timestamp);
                  double bpm;
-                 if(it == listener.hrPoints.end())
-                   bpm = listener.hrPoints.back().bpm;
-                 else if(it == listener.hrPoints.begin())
+                 if(it == mergedHrPoints.end())
+                   bpm = mergedHrPoints.back().bpm;
+                 else if(it == mergedHrPoints.begin())
                    bpm = it->bpm;
                  else {
                    auto prev = std::prev(it);
@@ -487,19 +580,14 @@ static Expression evaluate(Expression&& e) {
                  }
                  hrColumn.add(bpm);
                }
-               while(hrColumn.committedRows < table.rowCount)
-                 hrColumn.add(Symbol("NULL"));
+               mergedColumns["heart_rate"] = std::move(hrColumn);
              }
            }
 
-           auto tableEntry = listener.tables.find(msgType);
-           if(tableEntry == listener.tables.end())
-             return "Load::error: message type not found: "s + msgType;
-
            auto columns = ExpressionArguments {};
-           for(auto& [name, column] : tableEntry->second.columns)
+           for(auto& [name, builder] : mergedColumns)
              columns.emplace_back(
-                 ComplexExpression(Symbol(name), {}, {}, std::move(column).build()));
+                 ComplexExpression(Symbol(name), {}, {}, std::move(builder).build()));
 
            auto table = "Table"_(std::move(columns));
            if(plan.hasOtherFiles)
