@@ -1,0 +1,119 @@
+--- a/src/fit_mesg.hpp
++++ b/src/fit_mesg.hpp
+@@ -47,9 +47,11 @@
+     void SetLocalNum(const FIT_UINT8 newLocalNum);
+     FIT_BOOL HasField(const int fieldNum) const;
+     void AddField(const Field& field);
++    void AddField(Field&& field);
+     Field* AddField(const FIT_UINT8 fieldNum);
+     void AddDeveloperField(const DeveloperField& field);
+     void SetField(const Field& field);
++    void SetField(Field&& field);
+     void SetFields(const Mesg& mesg);
+     int GetNumFields() const;
+     int GetNumDevFields() const;
+--- a/src/fit_mesg.cpp
++++ b/src/fit_mesg.cpp
+@@ -12,6 +12,7 @@
+ 
+ #include <ostream>
+ #include <algorithm>
++#include <utility>
+ #include "fit_mesg.hpp"
+ #include "fit_mesg_definition.hpp"
+ 
+@@ -180,6 +181,14 @@
+         fields.push_back(field);
+ }
+ 
++void Mesg::AddField(Field&& field)
++{
++    Field *existingField = GetField(field.GetNum());
++
++    if (existingField == FIT_NULL)
++        fields.push_back(std::move(field));
++}
++
+ Field* Mesg::AddField(const FIT_UINT8 fieldNum)
+ {
+     Field *field = GetField(fieldNum);
+@@ -221,6 +230,20 @@
+     fields.push_back(field);
+ }
+ 
++void Mesg::SetField(Field&& field)
++{
++    for (int i = 0; i < (int)fields.size(); i++)
++    {
++        if (fields[i].GetNum() == field.GetNum())
++        {
++            fields[i] = std::move(field);
++            return;
++        }
++    }
++
++    fields.push_back(std::move(field));
++}
++
+ void Mesg::SetFields(const Mesg& mesg)
+ {
+     if (mesg.GetNum() != GetNum())
+--- a/src/fit_decode.cpp
++++ b/src/fit_decode.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include <iostream>
+ #include <sstream>
++#include <utility>
+ #include "fit_decode.hpp"
+ #include "fit_crc.hpp"
+ #include "fit_mesg_listener.hpp"
+@@ -801,8 +802,8 @@
+ 
+             if (fieldBytesLeft == 0)
+             {
+-                MesgDefinition defn = localMesgDefs[localMesgIndex];
+-                FieldDefinition* fldDefn = defn.GetFieldByIndex(fieldIndex);
++                const MesgDefinition& defn = localMesgDefs[localMesgIndex];
++                const FieldDefinition* fldDefn = defn.GetFieldByIndex(fieldIndex);
+                 FIT_UINT8 baseType = fldDefn->GetType() & FIT_BASE_TYPE_NUM_MASK;
+                 FIT_UINT8 typeSize = baseTypeSizes[baseType];
+                 FIT_BOOL read = FIT_TRUE;
+@@ -871,7 +872,7 @@
+ 
+                         if (field.GetNumValues() > 0)
+                         {
+-                            mesg.AddField(field);
++                            mesg.AddField(std::move(field));
+                         }
+                     }
+                 }
+@@ -938,8 +939,8 @@
+ 
+              if (fieldBytesLeft == 0)
+              {
+-                 MesgDefinition defn = localMesgDefs[localMesgIndex];
+-                 DeveloperFieldDefinition* fldDefn = defn.GetDevFieldByIndex(fieldIndex);
++                 const MesgDefinition& defn = localMesgDefs[localMesgIndex];
++                 const DeveloperFieldDefinition* fldDefn = defn.GetDevFieldByIndex(fieldIndex);
+                  FIT_UINT8 baseType = fldDefn->GetType() & FIT_BASE_TYPE_NUM_MASK;
+ 
+                  if (baseType < FIT_BASE_TYPES) // Ignore field if base type not supported.
+@@ -1031,7 +1032,7 @@
+                 else
+                 {
+                     componentField.AddRawValue(value, componentField.GetNumValues());
+-                    mesg.AddField(componentField);
++                    mesg.AddField(std::move(componentField));
+                 }
+             }
+             // The component field is itself a composite field (more than one component).  Don't use scale/offset, containing
+@@ -1073,7 +1074,7 @@
+                 else
+                 {
+                     componentField.AddRawValue(value, componentField.GetNumValues());
+-                    mesg.AddField(componentField);
++                    mesg.AddField(std::move(componentField));
+                 }
+             }
+         }
