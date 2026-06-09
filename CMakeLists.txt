@@ -46,7 +46,8 @@ ExternalProject_Add(FITSDK
   DOWNLOAD_EXTRACT_TIMESTAMP NEW
   DOWNLOAD_DIR $ENV{HOME}/.cmake-downloads/${CMAKE_PROJECT_NAME}
   PATCH_COMMAND patch -p1 -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/0001-noexcept-moves.patch &&
-                patch -p1 -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/0002-move-on-decode-and-mesgdef-by-ref.patch
+                patch -p1 -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/0002-move-on-decode-and-mesgdef-by-ref.patch &&
+                patch -p1 -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/0003-reserve-fields-vector.patch
   CONFIGURE_COMMAND ""
   BUILD_COMMAND ""
   INSTALL_COMMAND ""

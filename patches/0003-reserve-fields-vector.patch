@@ -1,0 +1,42 @@
+--- a/src/fit_mesg.hpp
++++ b/src/fit_mesg.hpp
+@@ -52,6 +52,7 @@
+     void AddDeveloperField(const DeveloperField& field);
+     void SetField(const Field& field);
+     void SetField(Field&& field);
++    void ReserveFields(std::size_t n);
+     void SetFields(const Mesg& mesg);
+     int GetNumFields() const;
+     int GetNumDevFields() const;
+--- a/src/fit_mesg.cpp
++++ b/src/fit_mesg.cpp
+@@ -253,6 +253,11 @@
+         SetField(mesg.fields[i]);
+ }
+ 
++void Mesg::ReserveFields(std::size_t n)
++{
++    fields.reserve(n);
++}
++
+ int Mesg::GetNumFields() const
+ {
+     return (int)fields.size();
+--- a/src/fit_decode.cpp
++++ b/src/fit_decode.cpp
+@@ -584,6 +584,7 @@
+ 
+                     mesg = Mesg(localMesgDefs[localMesgIndex].GetNum());
+                     mesg.SetLocalNum(localMesgIndex);
++                    mesg.ReserveFields(localMesgDefs[localMesgIndex].GetFields().size() + 1);
+                     mesg.AddField(timestampField);
+ 
+                     if (localMesgDefs[localMesgIndex].GetFields().size() == 0)
+@@ -611,6 +612,7 @@
+ 
+                         mesg = Mesg(localMesgDefs[localMesgIndex].GetNum());
+                         mesg.SetLocalNum(localMesgIndex);
++                        mesg.ReserveFields(localMesgDefs[localMesgIndex].GetFields().size());
+ 
+                         if (localMesgDefs[localMesgIndex].GetFields().size() != 0)
+                         {
