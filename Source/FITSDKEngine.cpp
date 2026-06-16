@@ -240,7 +240,8 @@ struct ColumnBuilder {
   }
 
   void appendNulls(size_t n) {
-    if(n == 0) return;
+    if(n == 0)
+      return;
     flush();
     spans.push_back(Span<Symbol>(std::vector<Symbol>(n, Symbol("NULL"))));
     committedRows += n;
@@ -267,6 +268,8 @@ struct ParseFlags {
   bool convert_datetimes_to_dates = true; // shift FIT timestamps to Unix epoch
   bool merge_heart_rates = false;         // interpolate HR from hr messages into target table
   bool enable_crc_check = true;           // validate file CRC; false → SkipHeader
+  std::optional<double> timestamp_min;    // skip files whose record range ends before this
+  std::optional<double> timestamp_max;    // skip files whose record range starts after this
 };
 
 // Seconds between the FIT epoch (Dec 31 1989 00:00 UTC) and the Unix epoch.
@@ -286,6 +289,17 @@ struct HrPoint {
 
 } // namespace
 
+static std::optional<double> tryAsDouble(Expression const& e) {
+  return std::visit(
+      [](auto const& v) -> std::optional<double> {
+        if constexpr(std::is_arithmetic_v<std::decay_t<decltype(v)>>)
+          return static_cast<double>(v);
+        else
+          return std::nullopt;
+      },
+      e);
+}
+
 static ParseFlags parseFlagsFrom(ExpressionArguments& dynamics, size_t startIndex) {
   ParseFlags flags;
   for(size_t i = startIndex; i < dynamics.size(); ++i) {
@@ -293,14 +307,24 @@ static ParseFlags parseFlagsFrom(ExpressionArguments& dynamics, size_t startInde
     if(!flagExpr)
       continue;
     auto [flagHead, flagStatics, flagArgs, flagSpans] = std::move(*flagExpr).decompose();
+    auto const& flagName = flagHead.getName();
+
+    if(flagName == "timestamp_min" || flagName == "timestamp_max") {
+      auto value = flagArgs.empty() ? std::nullopt : tryAsDouble(flagArgs[0]);
+      if(!value)
+        continue;
+      if(flagName == "timestamp_min")
+        flags.timestamp_min = *value;
+      else
+        flags.timestamp_max = *value;
+      continue;
+    }
+
     bool value = true;
     if(!flagArgs.empty()) {
-      if(auto* iv = std::get_if<int64_t>(&flagArgs[0]))
-        value = (*iv != 0);
-      else if(auto* dv = std::get_if<double>(&flagArgs[0]))
-        value = (*dv != 0.0);
+      if(auto const v = tryAsDouble(flagArgs[0]))
+        value = (*v != 0.0);
     }
-    auto const& flagName = flagHead.getName();
     if(flagName == "apply_scale_and_offset")
       flags.apply_scale_and_offset = value;
     else if(flagName == "expand_components")
@@ -315,6 +339,133 @@ static ParseFlags parseFlagsFrom(ExpressionArguments& dynamics, size_t startInde
       flags.enable_crc_check = value;
   }
   return flags;
+}
+
+struct TimestampBounds {
+  std::optional<double> minimum;
+  std::optional<double> maximum;
+};
+
+static TimestampBounds extractTimestampBounds(Expression const& predicate) {
+  TimestampBounds bounds;
+  auto const* ce = std::get_if<ComplexExpression>(&predicate);
+  if(!ce)
+    return bounds;
+  auto const& head = ce->getHead().getName();
+  auto const& dynamics = ce->getDynamicArguments();
+
+  if(head == "And") {
+    for(auto const& child : dynamics) {
+      auto childBounds = extractTimestampBounds(child);
+      if(childBounds.minimum)
+        bounds.minimum =
+            bounds.minimum ? std::max(*bounds.minimum, *childBounds.minimum) : *childBounds.minimum;
+      if(childBounds.maximum)
+        bounds.maximum =
+            bounds.maximum ? std::min(*bounds.maximum, *childBounds.maximum) : *childBounds.maximum;
+    }
+    return bounds;
+  }
+
+  if(dynamics.size() != 2)
+    return bounds;
+
+  // Normalise so timestamp is always on the left: if it's on the right, swap and flip.
+  auto const* leftSym = std::get_if<Symbol>(&dynamics[0]);
+  bool reversed = false;
+  if(!(leftSym && leftSym->getName() == "timestamp")) {
+    auto const* rightSym = std::get_if<Symbol>(&dynamics[1]);
+    if(!(rightSym && rightSym->getName() == "timestamp"))
+      return bounds;
+    reversed = true;
+  }
+  auto const& literalSide = dynamics[reversed ? 0 : 1];
+  auto value = tryAsDouble(literalSide);
+  if(!value)
+    return bounds;
+
+  auto setsMin = (head == "GreaterEqual" || head == "Greater");
+  auto setsMax = (head == "LessEqual" || head == "Less");
+  if(reversed)
+    std::swap(setsMin, setsMax);
+  if(setsMin)
+    bounds.minimum = *value;
+  else if(setsMax)
+    bounds.maximum = *value;
+  else if(head == "Equal") {
+    bounds.minimum = *value;
+    bounds.maximum = *value;
+  }
+  return bounds;
+}
+
+// Walk the table-source tree (descending through Project, OrderBy, Slice, etc. via their
+// first dynamic arg) and append (timestamp_min N) / (timestamp_max M) flags to the Load.
+// Bails on Project rewrites that rebind the `timestamp` column via (As ... timestamp).
+static Expression injectBoundsIntoLoad(Expression&& expr, TimestampBounds const& bounds) {
+  if(!bounds.minimum && !bounds.maximum)
+    return std::move(expr);
+  auto* ce = std::get_if<ComplexExpression>(&expr);
+  if(!ce)
+    return std::move(expr);
+  auto headName = ce->getHead().getName();
+
+  if(headName == "Load") {
+    auto [loadHead, loadStatics, loadArgs, loadSpans] = std::move(*ce).decompose();
+    if(bounds.minimum)
+      loadArgs.emplace_back("timestamp_min"_(*bounds.minimum));
+    if(bounds.maximum)
+      loadArgs.emplace_back("timestamp_max"_(*bounds.maximum));
+    return ComplexExpression(std::move(loadHead), std::move(loadStatics), std::move(loadArgs),
+                             std::move(loadSpans));
+  }
+
+  if(headName == "Project") {
+    auto const& dynamics = ce->getDynamicArguments();
+    for(size_t i = 1; i < dynamics.size(); ++i) {
+      auto const* asExpr = std::get_if<ComplexExpression>(&dynamics[i]);
+      if(!asExpr || asExpr->getHead().getName() != "As")
+        continue;
+      auto const& asArgs = asExpr->getDynamicArguments();
+      if(asArgs.empty())
+        continue;
+      auto const* aliasSym = std::get_if<Symbol>(&asArgs.back());
+      if(aliasSym && aliasSym->getName() == "timestamp")
+        return std::move(expr);
+    }
+  }
+
+  auto [opHead, opStatics, opArgs, opSpans] = std::move(*ce).decompose();
+  if(!opArgs.empty())
+    opArgs[0] = injectBoundsIntoLoad(std::move(opArgs[0]), bounds);
+  return ComplexExpression(std::move(opHead), std::move(opStatics), std::move(opArgs),
+                           std::move(opSpans));
+}
+
+static bool containsFilter(Expression const& e) {
+  auto const* ce = std::get_if<ComplexExpression>(&e);
+  if(!ce)
+    return false;
+  if(ce->getHead().getName() == "Filter")
+    return true;
+  for(auto const& child : ce->getDynamicArguments())
+    if(containsFilter(child))
+      return true;
+  return false;
+}
+
+static Expression applyTimestampPushdown(Expression&& e) {
+  using sentinel::Any_;
+  return std::move(e) //
+         <"Filter"_(Any_, Any_) >=
+          Recurse(applyTimestampPushdown)>[](auto, auto dynamics,
+                                             auto) -> Expression {
+           auto bounds = extractTimestampBounds(dynamics[1]);
+           if(bounds.minimum || bounds.maximum)
+             dynamics[0] = injectBoundsIntoLoad(std::move(dynamics[0]), bounds);
+           return "Filter"_(std::move(dynamics));
+         } //
+                                                          < Any_ >= Recurse(applyTimestampPushdown);
 }
 
 struct LoadPlan {
@@ -345,6 +496,89 @@ static Expression wrapForMixedDirectory(std::string path, Expression fitTable) {
   return "Union"_("Load"_(std::move(path)), std::move(fitTable));
 }
 
+struct FileTimeRange {
+  double startTime; // record-timestamp lower bound in the same space as emitted timestamps
+  double endTime;   // record-timestamp upper bound
+};
+
+// Read a FIT file's session message to estimate its record-timestamp range, then Pause()
+// the decoder so we don't pay for the full scan. Returns nullopt if the file can't be
+// opened or has no session metadata.
+static std::optional<FileTimeRange> readFileTimeRange(std::filesystem::path const& filePath,
+                                                      ParseFlags const& flags) {
+  auto file = std::fstream(filePath, std::ios::in | std::ios::binary);
+  if(!file.is_open())
+    return std::nullopt;
+
+  struct : fit::MesgListener {
+    fit::Decode* decode = nullptr;
+    bool fileIdSeen = false;
+    bool sessionSeen = false;
+    std::optional<double> startTime;
+    std::optional<double> totalElapsedTime;
+    ParseFlags flags;
+    void OnMesg(fit::Mesg& mesg) override {
+      if(mesg.GetName() == "file_id" && !fileIdSeen) {
+        fileIdSeen = true;
+      } else if(mesg.GetName() == "session" && !sessionSeen) {
+        auto* st = mesg.GetField("start_time");
+        if(st && st->IsValueValid())
+          startTime = flags.apply_scale_and_offset ? st->GetFLOAT64Value() : st->GetRawValue();
+        auto* tet = mesg.GetField("total_elapsed_time");
+        if(tet && tet->IsValueValid())
+          totalElapsedTime =
+              flags.apply_scale_and_offset ? tet->GetFLOAT64Value() : tet->GetRawValue();
+        sessionSeen = true;
+      }
+      if(fileIdSeen && sessionSeen)
+        decode->Pause();
+    }
+  } listener;
+  listener.flags = flags;
+
+  try {
+    fit::Decode decode;
+    listener.decode = &decode;
+    if(!flags.expand_components)
+      decode.SuppressComponentExpansion();
+    if(!flags.enable_crc_check)
+      decode.SkipHeader();
+    decode.Read(file, listener);
+  } catch(...) {
+    return std::nullopt;
+  }
+
+  if(!listener.startTime)
+    return std::nullopt;
+  double recordStart = *listener.startTime;
+  if(flags.convert_datetimes_to_dates && recordStart >= kFitDateTimeMin)
+    recordStart += kFitEpochOffset;
+  double recordEnd = recordStart + listener.totalElapsedTime.value_or(0.0);
+  return FileTimeRange {recordStart, recordEnd};
+}
+
+// Files with unreadable session metadata are kept (conservative).
+static std::vector<std::filesystem::path>
+filterFilesByTimeRange(std::vector<std::filesystem::path>&& files, ParseFlags const& flags) {
+  if(!flags.timestamp_min && !flags.timestamp_max)
+    return std::move(files);
+  std::vector<std::filesystem::path> filtered;
+  filtered.reserve(files.size());
+  for(auto& path : files) {
+    auto range = readFileTimeRange(path, flags);
+    if(!range) {
+      filtered.push_back(std::move(path));
+      continue;
+    }
+    if(flags.timestamp_max && range->startTime > *flags.timestamp_max)
+      continue;
+    if(flags.timestamp_min && range->endTime < *flags.timestamp_min)
+      continue;
+    filtered.push_back(std::move(path));
+  }
+  return filtered;
+}
+
 static Expression evaluate(Expression&& e) {
   using sentinel::Any_;
   using sentinel::AnySequence_;
@@ -360,6 +594,7 @@ static Expression evaluate(Expression&& e) {
            auto const& msgType = std::get<Symbol>(dynamics.at(1)).getName();
            auto flags = parseFlagsFrom(dynamics, 2);
            auto filePaths = std::move(plan.fitFiles);
+           filePaths = filterFilesByTimeRange(std::move(filePaths), flags);
 
            struct FitDataListener : fit::MesgListener {
              std::string_view targetType;
@@ -457,7 +692,8 @@ static Expression evaluate(Expression&& e) {
            };
 
            unsigned int hwc = std::thread::hardware_concurrency();
-           if(hwc == 0) hwc = 1;
+           if(hwc == 0)
+             hwc = 1;
            unsigned int numWorkers =
                std::min<unsigned int>(hwc, static_cast<unsigned int>(filePaths.size()));
 
@@ -469,7 +705,7 @@ static Expression evaluate(Expression&& e) {
            std::vector<std::optional<std::string>> workerErrors(numWorkers);
 
            {
-             std::atomic<size_t> nextFileIdx{0};
+             std::atomic<size_t> nextFileIdx {0};
              std::vector<std::thread> workers;
              workers.reserve(numWorkers);
              for(unsigned int w = 0; w < numWorkers; ++w) {
@@ -501,11 +737,13 @@ static Expression evaluate(Expression&& e) {
                  }
                });
              }
-             for(auto& t : workers) t.join();
+             for(auto& t : workers)
+               t.join();
            }
 
            for(auto& e : workerErrors)
-             if(e) return *e;
+             if(e)
+               return *e;
 
            // std::map keeps the column order alphabetical, matching single-listener output.
            std::map<std::string, ColumnBuilder> mergedColumns;
@@ -513,17 +751,20 @@ static Expression evaluate(Expression&& e) {
            auto msgTypeKey = std::string(msgType);
            for(auto& l : listeners) {
              auto it = l.tables.find(msgTypeKey);
-             if(it == l.tables.end()) continue;
+             if(it == l.tables.end())
+               continue;
              mergedRowCount += it->second.rowCount;
              for(auto const& [name, _] : it->second.columns) {
                // Skip native heart_rate when interpolating — HR merge will write the column.
-               if(flags.merge_heart_rates && name == "heart_rate") continue;
+               if(flags.merge_heart_rates && name == "heart_rate")
+                 continue;
                mergedColumns.try_emplace(name);
              }
            }
            for(auto& l : listeners) {
              auto it = l.tables.find(msgTypeKey);
-             if(it == l.tables.end()) continue;
+             if(it == l.tables.end())
+               continue;
              size_t lRows = it->second.rowCount;
              for(auto& [name, target] : mergedColumns) {
                auto colIt = it->second.columns.find(name);
@@ -534,8 +775,15 @@ static Expression evaluate(Expression&& e) {
              }
            }
 
-           if(mergedRowCount == 0)
+           if(mergedRowCount == 0) {
+             if(filePaths.empty()) {
+               auto emptyTable = "Table"_(ExpressionArguments {});
+               if(plan.hasOtherFiles)
+                 return wrapForMixedDirectory(std::string(path), std::move(emptyTable));
+               return std::move(emptyTable);
+             }
              return "Load::error: message type not found: "s + msgTypeKey;
+           }
 
            // Merge heart rate data: nearest-neighbour interpolation by timestamp.
            // rowTimestamps stays row-aligned with mergedColumns only because each
@@ -552,23 +800,20 @@ static Expression evaluate(Expression&& e) {
              mergedHrPoints.reserve(hrPointTotal);
              mergedRowTimestamps.reserve(rowTsTotal);
              for(auto& l : listeners) {
-               mergedHrPoints.insert(mergedHrPoints.end(),
-                                     l.hrPoints.begin(), l.hrPoints.end());
-               mergedRowTimestamps.insert(mergedRowTimestamps.end(),
-                                          l.rowTimestamps.begin(), l.rowTimestamps.end());
+               mergedHrPoints.insert(mergedHrPoints.end(), l.hrPoints.begin(), l.hrPoints.end());
+               mergedRowTimestamps.insert(mergedRowTimestamps.end(), l.rowTimestamps.begin(),
+                                          l.rowTimestamps.end());
              }
              if(!mergedHrPoints.empty()) {
                std::ranges::sort(mergedHrPoints, {}, &HrPoint::timestamp);
                ColumnBuilder hrColumn;
                for(size_t row = 0; row < mergedRowCount; ++row) {
-                 double ts =
-                     (row < mergedRowTimestamps.size()) ? mergedRowTimestamps[row] : -1.0;
+                 double ts = (row < mergedRowTimestamps.size()) ? mergedRowTimestamps[row] : -1.0;
                  if(ts < 0.0) {
                    hrColumn.add(Symbol("NULL"));
                    continue;
                  }
-                 auto it =
-                     std::ranges::lower_bound(mergedHrPoints, ts, {}, &HrPoint::timestamp);
+                 auto it = std::ranges::lower_bound(mergedHrPoints, ts, {}, &HrPoint::timestamp);
                  double bpm;
                  if(it == mergedHrPoints.end())
                    bpm = mergedHrPoints.back().bpm;
@@ -583,6 +828,7 @@ static Expression evaluate(Expression&& e) {
                mergedColumns["heart_rate"] = std::move(hrColumn);
              }
            }
+
 
            auto columns = ExpressionArguments {};
            for(auto& [name, builder] : mergedColumns)
@@ -602,6 +848,7 @@ static Expression evaluate(Expression&& e) {
 
            auto flags = parseFlagsFrom(dynamics, 1);
            auto filePaths = std::move(plan.fitFiles);
+           filePaths = filterFilesByTimeRange(std::move(filePaths), flags);
 
            struct SummaryListener : fit::MesgListener {
              ParseFlags flags;
@@ -762,5 +1009,8 @@ Message types (Garmin FIT protocol spec columns):
 };
 
 extern "C" BOSSExpression* evaluate(BOSSExpression* e) {
-  return new BOSSExpression {.delegate = evaluate(std::move(e->delegate))};
+  auto delegate = std::move(e->delegate);
+  if(containsFilter(delegate))
+    delegate = applyTimestampPushdown(std::move(delegate));
+  return new BOSSExpression {.delegate = evaluate(std::move(delegate))};
 };
