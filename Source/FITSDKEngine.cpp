@@ -479,6 +479,9 @@ static LoadPlan planLoad(std::string const& path) {
   std::filesystem::path p(path);
   if(std::filesystem::is_directory(p, ec)) {
     for(auto const& entry : std::filesystem::directory_iterator(p, ec)) {
+      auto const& name = entry.path().filename().string();
+      if(!name.empty() && name.front() == '.')
+        continue;
       if(entry.path().extension() == ".fit")
         plan.fitFiles.push_back(entry.path());
       else
