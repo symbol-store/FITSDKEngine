@@ -582,6 +582,176 @@ filterFilesByTimeRange(std::vector<std::filesystem::path>&& files, ParseFlags co
   return filtered;
 }
 
+// --- Filename correction -----------------------------------------------------
+// load is frequently called with paths that are *visually* correct but byte-wise
+// wrong, because some intermediary (a JSON layer, a copy-paste, an Apple export)
+// substituted a look-alike Unicode character for an ASCII one. The classic case
+// is U+00A0 (non-breaking space) where a plain space is expected, but zero-width
+// characters and the Unicode dash variants cause the same class of failure.
+//
+// To recover, we canonicalise both the requested filename and the names actually
+// on disk: invisible code points are dropped, the Unicode space and dash variants
+// collapse onto ASCII ' ' and '-'. If a directory entry canonicalises to the same
+// string as the (missing) requested name, that entry is the intended target.
+
+static void appendUtf8(std::string& out, char32_t cp) {
+  if(cp <= 0x7F) {
+    out.push_back(static_cast<char>(cp));
+  } else if(cp <= 0x7FF) {
+    out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+    out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+  } else if(cp <= 0xFFFF) {
+    out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+    out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+    out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+  } else {
+    out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+    out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+    out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+    out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+  }
+}
+
+// Code points that render as whitespace but are not ASCII space.
+static bool isUnicodeSpace(char32_t cp) {
+  switch(cp) {
+  case 0x00A0: // no-break space
+  case 0x1680: // ogham space mark
+  case 0x2000: case 0x2001: case 0x2002: case 0x2003: case 0x2004:
+  case 0x2005: case 0x2006: case 0x2007: case 0x2008: case 0x2009:
+  case 0x200A: // en/em/thin/hair spaces
+  case 0x202F: // narrow no-break space
+  case 0x205F: // medium mathematical space
+  case 0x3000: // ideographic space
+    return true;
+  default:
+    return false;
+  }
+}
+
+// Code points that render as a hyphen/dash but are not ASCII '-'.
+static bool isUnicodeDash(char32_t cp) {
+  switch(cp) {
+  case 0x2010: case 0x2011: case 0x2012: case 0x2013: case 0x2014:
+  case 0x2015: // hyphen .. horizontal bar
+  case 0x2212: // minus sign
+  case 0xFE58: case 0xFE63: // small em/hyphen-minus
+  case 0xFF0D: // fullwidth hyphen-minus
+    return true;
+  default:
+    return false;
+  }
+}
+
+// Zero-width / formatting code points that should simply vanish.
+static bool isInvisible(char32_t cp) {
+  switch(cp) {
+  case 0x00AD: // soft hyphen
+  case 0x200B: // zero-width space
+  case 0x200C: // zero-width non-joiner
+  case 0x200D: // zero-width joiner
+  case 0x2060: // word joiner
+  case 0xFEFF: // zero-width no-break space / BOM
+    return true;
+  default:
+    return false;
+  }
+}
+
+static std::string canonicaliseFilename(std::string const& s) {
+  std::string out;
+  out.reserve(s.size());
+  size_t i = 0, n = s.size();
+  while(i < n) {
+    unsigned char c = static_cast<unsigned char>(s[i]);
+    char32_t cp = 0;
+    size_t len = 1;
+    if(c < 0x80) {
+      cp = c;
+      len = 1;
+    } else if((c >> 5) == 0x6) {
+      cp = c & 0x1F;
+      len = 2;
+    } else if((c >> 4) == 0xE) {
+      cp = c & 0x0F;
+      len = 3;
+    } else if((c >> 3) == 0x1E) {
+      cp = c & 0x07;
+      len = 4;
+    } else {
+      // Invalid lead byte — pass through verbatim.
+      out.push_back(s[i++]);
+      continue;
+    }
+    if(i + len > n) {
+      out.push_back(s[i++]);
+      continue;
+    }
+    bool valid = true;
+    for(size_t k = 1; k < len; ++k) {
+      unsigned char cc = static_cast<unsigned char>(s[i + k]);
+      if((cc >> 6) != 0x2) {
+        valid = false;
+        break;
+      }
+      cp = (cp << 6) | (cc & 0x3F);
+    }
+    if(!valid) {
+      out.push_back(s[i++]);
+      continue;
+    }
+    i += len;
+    if(isInvisible(cp))
+      continue;
+    if(isUnicodeSpace(cp))
+      out.push_back(' ');
+    else if(isUnicodeDash(cp))
+      out.push_back('-');
+    else
+      appendUtf8(out, cp);
+  }
+  return out;
+}
+
+// If `requested` does not exist but a sibling entry canonicalises to the same
+// name, return that sibling's path — the filename the caller almost certainly
+// meant. Returns nullopt when the path already exists or no match is found.
+static std::optional<std::filesystem::path>
+findFilenameCorrection(std::filesystem::path const& requested) {
+  std::error_code ec;
+  if(std::filesystem::exists(requested, ec))
+    return std::nullopt;
+  auto parent = requested.parent_path();
+  if(parent.empty())
+    parent = std::filesystem::path(".");
+  if(!std::filesystem::is_directory(parent, ec))
+    return std::nullopt;
+  auto target = canonicaliseFilename(requested.filename().string());
+  if(target.empty())
+    return std::nullopt;
+  for(auto const& entry : std::filesystem::directory_iterator(parent, ec)) {
+    if(canonicaliseFilename(entry.path().filename().string()) == target)
+      return entry.path();
+  }
+  return std::nullopt;
+}
+
+// Build (DidYouMean (Load <corrected> <rest...>)) if the load's path argument
+// names a missing file with a canonical match on disk. The returned expression
+// is a suggestion: it is *not* evaluated, leaving the caller to confirm.
+static std::optional<Expression> correctLoadFilename(ExpressionArguments& dynamics) {
+  if(dynamics.empty())
+    return std::nullopt;
+  auto const* pathArg = std::get_if<std::string>(&dynamics[0]);
+  if(!pathArg)
+    return std::nullopt;
+  auto corrected = findFilenameCorrection(std::filesystem::path(*pathArg));
+  if(!corrected)
+    return std::nullopt;
+  dynamics[0] = corrected->string();
+  return "DidYouMean"_("Load"_(std::move(dynamics)));
+}
+
 static Expression evaluate(Expression&& e) {
   using sentinel::Any_;
   using sentinel::AnySequence_;
@@ -589,6 +759,8 @@ static Expression evaluate(Expression&& e) {
   return std::move(e) //
          <"Load"_(Any_, Symbol_, AnySequence_) >= Recurse(evaluate)>[](auto, auto dynamics,
                                                                        auto) -> Expression {
+           if(auto suggestion = correctLoadFilename(dynamics))
+             return std::move(*suggestion);
            auto const& path = std::get<std::string>(dynamics.at(0));
            auto plan = planLoad(path);
            if(plan.fitFiles.empty())
@@ -844,6 +1016,8 @@ static Expression evaluate(Expression&& e) {
            return std::move(table);
          } < "Load"_(Any_, AnySequence_) >= Recurse(evaluate) > [](auto, auto dynamics,
                                                                    auto) -> Expression {
+           if(auto suggestion = correctLoadFilename(dynamics))
+             return std::move(*suggestion);
            auto const& path = std::get<std::string>(dynamics.at(0));
            auto plan = planLoad(path);
            if(plan.fitFiles.empty())
@@ -984,6 +1158,8 @@ Message types (Garmin FIT protocol spec columns):
 **Path conventions:** Paths must be absolute. `~` is not expanded (BOSS does not invoke shell expansion). Use `/Users/<name>/...` on macOS, `/home/<name>/...` on Linux.
 
              **Unicode in filenames:** Raw UTF-8 and JSON `\uXXXX` escapes are both accepted and equivalent - use whichever your client emits naturally. The real hazard is *invisible* Unicode: filenames produced by Apple devices commonly contain U+00A0 (non-breaking space) where a regular space appears to be - for instance, between "Apple" and "Watch" in Apple Watch export filenames. NBSP renders identically to a regular space everywhere, including in the `file` column returned by the directory-summary query, so it cannot be detected by sight. If `Load` reports `cannot open file` on a path that *visually* matches the directory listing, write the suspect gaps explicitly as `\u00a0` and retry. The same caution applies to U+200B (zero-width space), U+00AD (soft hyphen), and the Unicode dash variants. Discover the row with `(Slice (OrderBy (Load ".../dir") (List (Desc time_created))) 0 1)`.
+
+**Auto-correction:** When `Load` is given a single file path that does not exist but whose name matches a file on disk *after* collapsing these look-alike code points (Unicode spaces \u2192 space, Unicode dashes \u2192 `-`, zero-width characters dropped), the engine does not error. Instead it returns the same query with the on-disk filename substituted, wrapped as `(DidYouMean (Load "/corrected/path.fit" ...))`. This is a suggestion, not a result: re-issue the inner `Load` to actually read the file.
 
 **Key patterns:**
 ```
