@@ -1,0 +1,153 @@
+--- a/src/fit_decode.cpp
++++ b/src/fit_decode.cpp
+@@ -11,6 +11,7 @@
+ 
+ 
+ 
++#include <algorithm>
+ #include <iostream>
+ #include <sstream>
+ #include <utility>
+@@ -96,6 +97,7 @@ FIT_BOOL Decode::CheckIntegrity(std::istream &file)
+ {
+     FIT_BOOL status = FIT_TRUE;
+ 
++    mesgFilter.clear(); // A filter only applies to the Read it was passed to.
+     InitRead(file);
+ 
+     try
+@@ -170,6 +172,15 @@ void Decode::IncompleteStream()
+     streamIsComplete = FIT_FALSE;
+ }
+ 
++FIT_BOOL Decode::IsMesgWanted(const FIT_UINT16 mesgNum) const
++{
++    // Filters are tiny and this runs once per definition or decoded message.
++    return mesgFilter.empty()
++        || (std::find(mesgFilter.begin(), mesgFilter.end(), mesgNum) != mesgFilter.end())
++        || (mesgNum == FIT_MESG_NUM_DEVELOPER_DATA_ID)
++        || (mesgNum == FIT_MESG_NUM_FIELD_DESCRIPTION);
++}
++
+ FIT_BOOL Decode::Read(std::istream* file)
+ {
+     FIT_BOOL status = FIT_TRUE;
+@@ -200,24 +211,26 @@ FIT_BOOL Decode::Read
+     std::istream* file,
+     MesgListener* mesgListener,
+     MesgDefinitionListener* definitionListener,
+-    DeveloperFieldDescriptionListener* descriptionListener
++    DeveloperFieldDescriptionListener* descriptionListener,
++    const std::vector<FIT_UINT16>& mesgFilter
+     )
+ {
+     this->mesgListener = mesgListener;
+     this->mesgDefinitionListener = definitionListener;
+     this->descriptionListener = descriptionListener;
++    this->mesgFilter = mesgFilter;
+ 
+     return Read(file);
+ }
+ 
+-FIT_BOOL Decode::Read(std::istream &file, MesgListener& mesgListener)
++FIT_BOOL Decode::Read(std::istream &file, MesgListener& mesgListener, const std::vector<FIT_UINT16>& mesgFilter)
+ {
+-    return Read(&file, &mesgListener, nullptr, nullptr);
++    return Read(&file, &mesgListener, nullptr, nullptr, mesgFilter);
+ }
+ 
+-FIT_BOOL Decode::Read(std::istream &file, MesgListener& mesgListener, MesgDefinitionListener& mesgDefinitionListener)
++FIT_BOOL Decode::Read(std::istream &file, MesgListener& mesgListener, MesgDefinitionListener& mesgDefinitionListener, const std::vector<FIT_UINT16>& mesgFilter)
+ {
+-    return Read(&file, &mesgListener, &mesgDefinitionListener, nullptr);
++    return Read(&file, &mesgListener, &mesgDefinitionListener, nullptr, mesgFilter);
+ }
+ 
+ 
+@@ -297,7 +310,7 @@ FIT_BOOL Decode::Resume(void)
+ 
+                     
+ 
+-                    if (mesgListener)
++                    if (mesgListener && IsMesgWanted(mesg.GetNum()))
+                         mesgListener->OnMesg(mesg);
+                     break;
+ 
+--- a/src/fit_decode.hpp
++++ b/src/fit_decode.hpp
+@@ -26,6 +26,7 @@
+ #include "fit_mesg_listener.hpp"
+ #include "fit_runtime_exception.hpp"
+ #include "fit_developer_data_id_mesg.hpp"
++#include <vector>
+ 
+ namespace fit
+ {
+@@ -74,22 +75,24 @@ public:
+     // up processing significantly.
+     ///////////////////////////////////////////////////////////////////////
+ 
+-    FIT_BOOL Read(std::istream &file, MesgListener& mesgListener);
++    FIT_BOOL Read(std::istream &file, MesgListener& mesgListener, const std::vector<FIT_UINT16>& mesgFilter = {});
+     ///////////////////////////////////////////////////////////////////////
+     // Reads a FIT binary file.
+     // Parameters:
+     //    file                    Pointer to file to read.
+     //    mesgListener            Message listener
++    //    mesgFilter              Optional message filter (see below)
+     // Returns true if finished read file, otherwise false if decoding is paused.
+     ///////////////////////////////////////////////////////////////////////
+ 
+-    FIT_BOOL Read(std::istream &file, MesgListener& mesgListener, MesgDefinitionListener& mesgDefinitionListener);
++    FIT_BOOL Read(std::istream &file, MesgListener& mesgListener, MesgDefinitionListener& mesgDefinitionListener, const std::vector<FIT_UINT16>& mesgFilter = {});
+     ///////////////////////////////////////////////////////////////////////
+     // Reads a FIT binary file.
+     // Parameters:
+     //    file                    Pointer to file to read.
+     //    mesgListener            Message listener
+     //    mesgDefinitionListener  Message definition listener
++    //    mesgFilter              Optional message filter (see below)
+     // Returns true if finished read file, otherwise false if decoding is paused.
+     ///////////////////////////////////////////////////////////////////////
+ 
+@@ -98,7 +101,8 @@ public:
+         std::istream* file,
+         MesgListener* mesgListener,
+         MesgDefinitionListener* definitionListener,
+-        DeveloperFieldDescriptionListener* descriptionListener
++        DeveloperFieldDescriptionListener* descriptionListener,
++        const std::vector<FIT_UINT16>& mesgFilter = {}
+         );
+     ///////////////////////////////////////////////////////////////////////
+     // Reads a FIT binary file.
+@@ -107,7 +111,14 @@ public:
+     //    mesgListener            Message listener
+     //    definitionListener      Message definition listener
+     //    descriptionListener     Developer field description listener
++    //    mesgFilter              Optional message filter (see below)
+     // Returns true if finished read file, otherwise false if decoding is paused.
++    //
++    // A non-empty mesgFilter restricts the messages passed to the listener to
++    // the listed global message numbers for this read (including any Resume
++    // of it). developer_data_id and field_description messages are always
++    // passed on because later developer fields depend on them. An empty
++    // filter passes on all messages.
+     ///////////////////////////////////////////////////////////////////////
+ 
+ 
+@@ -202,6 +213,7 @@ private:
+     FIT_BOOL streamIsComplete;
+     FIT_BOOL invalidDataSize;
+     FIT_BOOL suppressComponentExpansion;
++    std::vector<FIT_UINT16> mesgFilter; // Filter of the current Read; empty means no filter.
+     FIT_UINT32 currentByteOffset;
+     std::unordered_map<FIT_UINT8, DeveloperDataIdMesg> developers;
+     std::unordered_map<FIT_UINT8, std::unordered_map<FIT_UINT8, FieldDescriptionMesg>> descriptions;
+@@ -214,6 +226,7 @@ private:
+     void InitRead(std::istream &file, FIT_BOOL startOfFile);
+     void UpdateEndianness(FIT_UINT8 type, FIT_UINT8 size);
+     RETURN ReadByte(FIT_UINT8 data);
++    FIT_BOOL IsMesgWanted(const FIT_UINT16 mesgNum) const;
+     void ExpandComponents(Field* containingField, const Profile::FIELD_COMPONENT* components, FIT_UINT16 numComponents);
+     FIT_BOOL Read(std::istream* file);
+ };
