@@ -259,6 +259,193 @@ struct MessageTable {
   std::map<std::string, ColumnBuilder> columns;
 };
 
+// A table built row by row and emitted shape-wise partitioned (Mohr-Daurat et al., PVLDB
+// 17(11)): rows are grouped by their shape, i.e. the atom type of each column, and every
+// partition becomes exactly one span per column, so span k of every column covers the same
+// rows. A missing value is a NULL symbol, i.e. just another atom type. Row order is not
+// preserved.
+class ShapeWiseTable {
+public:
+  using Value = std::variant<double, std::string, Symbol>;
+
+  // Dense id of a column; columns are emitted in the order they are first registered.
+  size_t column(std::string const& name) {
+    auto [it, inserted] = columnIds.try_emplace(name, columnNames.size());
+    if(inserted) {
+      columnNames.push_back(name);
+      row.emplace_back();
+    }
+    return it->second;
+  }
+
+  std::vector<std::string> const& columns() const { return columnNames; }
+  bool empty() const { return partitions.empty(); }
+
+  // Sets a cell of the current row (a double, std::string or Symbol). The first value set for
+  // a column wins.
+  template <typename T> void set(size_t columnId, T&& value) {
+    if(std::holds_alternative<std::monostate>(row[columnId]))
+      row[columnId] = std::forward<T>(value);
+  }
+
+  // Completes the current row; columns without a value are NULL.
+  void endRow() {
+    shape.clear();
+    for(uint32_t c = 0; c < row.size(); ++c)
+      if(row[c].index() != 0)
+        shape.emplace_back(c, static_cast<uint8_t>(row[c].index() - 1)); // as Value index
+    // Consecutive rows mostly share a shape; only look up the partition when it changes.
+    if(!lastPartition || shape != lastShape) {
+      lastShape = shape;
+      lastPartition = &partitionFor(shape);
+    }
+    for(size_t j = 0; j < shape.size(); ++j) {
+      auto& cell = row[shape[j].first];
+      std::visit(
+          [&](auto&& value) {
+            using T = std::decay_t<decltype(value)>;
+            if constexpr(!std::is_same_v<T, std::monostate>)
+              std::get<std::vector<T>>(lastPartition->columns[j]).push_back(std::move(value));
+          },
+          std::move(cell));
+      cell = std::monostate {};
+    }
+    lastPartition->rows++;
+  }
+
+  // Moves all rows of other into this table, matching columns by name.
+  void append(ShapeWiseTable&& other) {
+    std::vector<uint32_t> columnMap;
+    for(auto const& name : other.columnNames)
+      columnMap.push_back(static_cast<uint32_t>(column(name)));
+    for(auto& [otherShape, otherPartition] : other.partitions) {
+      // Translate the shape to this table's column ids, which may sort differently.
+      std::vector<std::pair<ShapeEntry, size_t>> entries; // (entry, index in otherShape)
+      entries.reserve(otherShape.size());
+      for(size_t j = 0; j < otherShape.size(); ++j)
+        entries.push_back({{columnMap[otherShape[j].first], otherShape[j].second}, j});
+      std::ranges::sort(entries);
+      Shape translated;
+      translated.reserve(entries.size());
+      for(auto const& [entry, _] : entries)
+        translated.push_back(entry);
+      auto& partition = partitionFor(translated);
+      for(size_t k = 0; k < entries.size(); ++k) {
+        auto& source = otherPartition.columns[entries[k].second];
+        if(partition.rows == 0) { // New here: take the values over without copying.
+          partition.columns[k] = std::move(source);
+          continue;
+        }
+        std::visit(
+            [&](auto& values) {
+              auto& target = std::get<std::decay_t<decltype(values)>>(partition.columns[k]);
+              target.insert(target.end(), std::make_move_iterator(values.begin()),
+                            std::make_move_iterator(values.end()));
+            },
+            source);
+      }
+      partition.rows += otherPartition.rows;
+    }
+    other = ShapeWiseTable(); // Free the moved-from values now.
+  }
+
+  // Adds the double column `name`, computed as fn(source value) in every partition where the
+  // double column `source` is set, and NULL elsewhere (keeping partitions shape-homogeneous).
+  template <typename F>
+  void deriveColumn(std::string const& name, std::string const& source, F const& fn) {
+    auto derivedId = static_cast<uint32_t>(column(name));
+    auto sourceIt = columnIds.find(source);
+    if(sourceIt == columnIds.end())
+      return;
+    ShapeEntry const sourceEntry {static_cast<uint32_t>(sourceIt->second), doubleIndex};
+    decltype(partitions) derived;
+    while(!partitions.empty()) {
+      auto node = partitions.extract(partitions.begin());
+      auto& key = node.key();
+      auto& partition = node.mapped();
+      auto sourcePos = std::ranges::find(key, sourceEntry);
+      if(sourcePos != key.end()) {
+        auto const& sourceValues =
+            std::get<std::vector<double>>(partition.columns[sourcePos - key.begin()]);
+        std::vector<double> values;
+        values.reserve(sourceValues.size());
+        std::ranges::transform(sourceValues, std::back_inserter(values), fn);
+        ShapeEntry const entry {derivedId, doubleIndex};
+        auto pos = std::ranges::lower_bound(key, entry) - key.begin();
+        key.insert(key.begin() + pos, entry);
+        partition.columns.insert(partition.columns.begin() + pos, std::move(values));
+      }
+      derived.insert(std::move(node));
+    }
+    partitions = std::move(derived);
+    lastPartition = nullptr;
+  }
+
+  // One span per column per partition.
+  ExpressionArguments build() && {
+    std::vector<ExpressionSpanArguments> spans(columnNames.size());
+    for(auto& [key, partition] : partitions) {
+      size_t j = 0;
+      for(size_t c = 0; c < columnNames.size(); ++c) {
+        if(j < key.size() && key[j].first == c) {
+          std::visit(
+              [&](auto& values) {
+                using T = typename std::decay_t<decltype(values)>::value_type;
+                spans[c].push_back(Span<T>(std::move(values)));
+              },
+              partition.columns[j++]);
+        } else {
+          spans[c].push_back(Span<Symbol>(std::vector<Symbol>(partition.rows, Symbol("NULL"))));
+        }
+      }
+    }
+    ExpressionArguments result;
+    for(size_t c = 0; c < columnNames.size(); ++c)
+      result.emplace_back(ComplexExpression(Symbol(columnNames[c]), {}, {}, std::move(spans[c])));
+    return result;
+  }
+
+private:
+  using Cell = std::variant<std::monostate, double, std::string, Symbol>; // monostate: unset
+  using ColumnValues = boss::utilities::rewrap_variant_arguments<std::vector, Value>::type;
+  using ShapeEntry = std::pair<uint32_t, uint8_t>; // (column id, Value index)
+  using Shape = std::vector<ShapeEntry>;           // Non-NULL cells, sorted by column id.
+
+  static constexpr uint8_t doubleIndex = 0; // Value index of double
+  static_assert(std::is_same_v<std::variant_alternative_t<doubleIndex, Value>, double>);
+
+  struct Partition {
+    size_t rows = 0;
+    std::vector<ColumnValues> columns; // One per shape entry, in shape order.
+  };
+
+  static ColumnValues emptyColumn(uint8_t valueIndex) {
+    return [valueIndex]<size_t... I>(std::index_sequence<I...>) {
+      ColumnValues column;
+      ((I == valueIndex ? (void)column.emplace<I>() : void()), ...);
+      return column;
+    }(std::make_index_sequence<std::variant_size_v<Value>>());
+  }
+
+  Partition& partitionFor(Shape const& key) {
+    auto [it, inserted] = partitions.try_emplace(key);
+    if(inserted)
+      for(auto const& [_, valueIndex] : key)
+        it->second.columns.push_back(emptyColumn(valueIndex));
+    return it->second;
+  }
+
+  std::unordered_map<std::string, size_t> columnIds;
+  std::vector<std::string> columnNames;
+  std::map<Shape, Partition> partitions;
+
+  // Current row (one cell per column) and the shape and partition of the previous row.
+  std::vector<Cell> row;
+  Shape shape;
+  Shape lastShape;
+  Partition* lastPartition = nullptr;
+};
+
 // Parsing options exposed as symbolic flags on the Load operator.
 // Each flag is passed as a ComplexExpression: "flag_name"_(0_or_1).
 // Omitting a flag leaves its default in effect.
@@ -281,6 +468,13 @@ static constexpr double kFitDateTimeMin = static_cast<double>(0x10000000u);
 
 static bool isDateTimeField(std::string_view name) {
   return name == "timestamp" || name == "local_timestamp";
+}
+
+// A FIT date_time value as the engine emits it: shifted to the Unix epoch when requested,
+// except for relative values, which stay as they are.
+static double convertDateTime(double value, ParseFlags const& flags) {
+  return flags.convert_datetimes_to_dates && value >= kFitDateTimeMin ? value + kFitEpochOffset
+                                                                      : value;
 }
 
 struct HrPoint {
@@ -611,9 +805,7 @@ static std::optional<FileTimeRange> readFileTimeRange(std::filesystem::path cons
 
   if(!listener.startTime)
     return std::nullopt;
-  double recordStart = *listener.startTime;
-  if(flags.convert_datetimes_to_dates && recordStart >= kFitDateTimeMin)
-    recordStart += kFitEpochOffset;
+  double recordStart = convertDateTime(*listener.startTime, flags);
   double recordEnd = recordStart + listener.totalElapsedTime.value_or(0.0);
   return FileTimeRange {recordStart, recordEnd};
 }
@@ -1111,9 +1303,8 @@ static Expression evaluate(Expression&& e) {
                  return std::nullopt;
                double value =
                    flags.apply_scale_and_offset ? field->GetFLOAT64Value() : field->GetRawValue();
-               if(flags.convert_datetimes_to_dates && isDateTimeField(name) &&
-                  value >= kFitDateTimeMin)
-                 value += kFitEpochOffset;
+               if(isDateTimeField(name))
+                 value = convertDateTime(value, flags);
                return value;
              }
 
@@ -1136,28 +1327,21 @@ static Expression evaluate(Expression&& e) {
              }
            };
 
-           ColumnBuilder fileColumn;
-           ColumnBuilder timeCreatedColumn;
-           ColumnBuilder startTimeColumn;
-           ColumnBuilder sportColumn;
-           ColumnBuilder totalElapsedTimeColumn;
-           ColumnBuilder totalDistanceColumn;
-           ColumnBuilder totalCaloriesColumn;
+           ShapeWiseTable summary;
+           auto fileColumn = summary.column("file");
+           auto timeCreatedColumn = summary.column("time_created");
+           auto startTimeColumn = summary.column("start_time");
+           auto sportColumn = summary.column("sport");
+           auto totalElapsedTimeColumn = summary.column("total_elapsed_time");
+           auto totalDistanceColumn = summary.column("total_distance");
+           auto totalCaloriesColumn = summary.column("total_calories");
 
-           auto addOptionalDouble = [](ColumnBuilder& column, std::optional<double> value) {
+           auto setOptional = [&summary](size_t column, auto const& value) {
              if(value)
-               column.add(*value);
-             else
-               column.add(Symbol("NULL"));
-           };
-           auto addOptionalSymbol = [](ColumnBuilder& column, std::optional<Symbol> value) {
-             if(value)
-               column.add(*value);
-             else
-               column.add(Symbol("NULL"));
+               summary.set(column, *value);
            };
 
-           // Decode in parallel into per-file slots; rows (and the first error) stay in file order.
+           // Decode in parallel into per-file slots; the first error is reported in file order.
            std::vector<SummaryListener> summaries(filePaths.size());
            std::vector<std::optional<std::string>> errors(filePaths.size());
            parallelFor(filePaths.size(), [&](size_t, size_t i) {
@@ -1171,32 +1355,17 @@ static Expression evaluate(Expression&& e) {
              auto const& filePath = filePaths[i];
              auto const& summaryListener = summaries[i];
 
-             fileColumn.add(filePath.filename().string());
-             addOptionalDouble(timeCreatedColumn, summaryListener.timeCreated);
-             addOptionalDouble(startTimeColumn, summaryListener.startTime);
-             addOptionalSymbol(sportColumn, summaryListener.sport);
-             addOptionalDouble(totalElapsedTimeColumn, summaryListener.totalElapsedTime);
-             addOptionalDouble(totalDistanceColumn, summaryListener.totalDistance);
-             addOptionalDouble(totalCaloriesColumn, summaryListener.totalCalories);
+             summary.set(fileColumn, filePath.filename().string());
+             setOptional(timeCreatedColumn, summaryListener.timeCreated);
+             setOptional(startTimeColumn, summaryListener.startTime);
+             setOptional(sportColumn, summaryListener.sport);
+             setOptional(totalElapsedTimeColumn, summaryListener.totalElapsedTime);
+             setOptional(totalDistanceColumn, summaryListener.totalDistance);
+             setOptional(totalCaloriesColumn, summaryListener.totalCalories);
+             summary.endRow();
            }
 
-           auto columns = ExpressionArguments {};
-           columns.emplace_back(
-               ComplexExpression(Symbol("file"), {}, {}, std::move(fileColumn).build()));
-           columns.emplace_back(ComplexExpression(Symbol("time_created"), {}, {},
-                                                  std::move(timeCreatedColumn).build()));
-           columns.emplace_back(
-               ComplexExpression(Symbol("start_time"), {}, {}, std::move(startTimeColumn).build()));
-           columns.emplace_back(
-               ComplexExpression(Symbol("sport"), {}, {}, std::move(sportColumn).build()));
-           columns.emplace_back(ComplexExpression(Symbol("total_elapsed_time"), {}, {},
-                                                  std::move(totalElapsedTimeColumn).build()));
-           columns.emplace_back(ComplexExpression(Symbol("total_distance"), {}, {},
-                                                  std::move(totalDistanceColumn).build()));
-           columns.emplace_back(ComplexExpression(Symbol("total_calories"), {}, {},
-                                                  std::move(totalCaloriesColumn).build()));
-
-           auto table = "Table"_(std::move(columns));
+           auto table = "Table"_(std::move(summary).build());
            if(plan.hasOtherFiles)
              return wrapForMixedDirectory(std::string(path), std::move(table));
            return std::move(table);
