@@ -11,6 +11,7 @@
 #include "fit_runtime_exception.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <filesystem>
 #include <fstream>
@@ -287,6 +288,76 @@ struct HrPoint {
   double bpm;
 };
 
+// Message filter for Decode::Read restricting decoding to the named message types, so the SDK
+// skips everything else (mostly `record` messages) without decoding it. A name unknown to the
+// profile yields an empty filter (decode everything), so the listener sees exactly what it
+// would without the filter.
+static std::vector<FIT_UINT16> mesgFilterFor(std::initializer_list<std::string> names) {
+  std::vector<FIT_UINT16> mesgNums;
+  for(auto const& name : names) {
+    auto const* profile = fit::Profile::GetMesg(name);
+    if(!profile)
+      return {};
+    mesgNums.push_back(profile->num);
+  }
+  return mesgNums;
+}
+
+// The messages read by the directory summary and the timestamp pre-filter.
+static std::vector<FIT_UINT16> const& summaryMesgFilter() {
+  static auto const filter = mesgFilterFor({"file_id", "session"});
+  return filter;
+}
+
+// Decode one file into `listener` with the parse flags applied. Listeners with a `decode`
+// member (to Pause() once they have what they need) get the decoder. Returns the Load error
+// message on failure.
+template <typename Listener>
+static std::optional<std::string> decodeFile(std::filesystem::path const& filePath,
+                                             Listener& listener, ParseFlags const& flags,
+                                             std::vector<FIT_UINT16> const& mesgFilter) {
+  auto file = std::fstream(filePath, std::ios::in | std::ios::binary);
+  if(!file.is_open())
+    return "Load::error: cannot open file: "s + filePath.string();
+  try {
+    fit::Decode decode;
+    if constexpr(requires { listener.decode; })
+      listener.decode = &decode;
+    if(!flags.expand_components)
+      decode.SuppressComponentExpansion();
+    if(!flags.enable_crc_check)
+      decode.SkipHeader();
+    decode.Read(file, listener, mesgFilter);
+  } catch(fit::RuntimeException const& e) {
+    return "Load::error: "s + e.what();
+  } catch(...) {
+    return "Load::error: unknown exception during decode"s;
+  }
+  return std::nullopt;
+}
+
+// Number of threads parallelFor uses for n items; size per-worker state with it.
+static size_t workerCount(size_t n) {
+  return std::min<size_t>(std::max(1u, std::thread::hardware_concurrency()), n);
+}
+
+// Runs fn(worker, i) for every i in [0, n) on workerCount(n) threads, where worker is the
+// index of the calling thread. fn must not throw.
+template <typename F> static void parallelFor(size_t n, F const& fn) {
+  size_t numWorkers = workerCount(n);
+  std::atomic<size_t> next {0};
+  std::vector<std::thread> workers;
+  workers.reserve(numWorkers);
+  for(size_t w = 0; w < numWorkers; ++w)
+    workers.emplace_back([&, w]() {
+      size_t i;
+      while((i = next.fetch_add(1, std::memory_order_relaxed)) < n)
+        fn(w, i);
+    });
+  for(auto& t : workers)
+    t.join();
+}
+
 } // namespace
 
 static std::optional<double> tryAsDouble(Expression const& e) {
@@ -509,10 +580,6 @@ struct FileTimeRange {
 // opened or has no session metadata.
 static std::optional<FileTimeRange> readFileTimeRange(std::filesystem::path const& filePath,
                                                       ParseFlags const& flags) {
-  auto file = std::fstream(filePath, std::ios::in | std::ios::binary);
-  if(!file.is_open())
-    return std::nullopt;
-
   struct : fit::MesgListener {
     fit::Decode* decode = nullptr;
     bool fileIdSeen = false;
@@ -539,17 +606,8 @@ static std::optional<FileTimeRange> readFileTimeRange(std::filesystem::path cons
   } listener;
   listener.flags = flags;
 
-  try {
-    fit::Decode decode;
-    listener.decode = &decode;
-    if(!flags.expand_components)
-      decode.SuppressComponentExpansion();
-    if(!flags.enable_crc_check)
-      decode.SkipHeader();
-    decode.Read(file, listener);
-  } catch(...) {
+  if(decodeFile(filePath, listener, flags, summaryMesgFilter()))
     return std::nullopt;
-  }
 
   if(!listener.startTime)
     return std::nullopt;
@@ -565,10 +623,13 @@ static std::vector<std::filesystem::path>
 filterFilesByTimeRange(std::vector<std::filesystem::path>&& files, ParseFlags const& flags) {
   if(!flags.timestamp_min && !flags.timestamp_max)
     return std::move(files);
+  std::vector<std::optional<FileTimeRange>> ranges(files.size());
+  parallelFor(files.size(), [&](size_t, size_t i) { ranges[i] = readFileTimeRange(files[i], flags); });
   std::vector<std::filesystem::path> filtered;
   filtered.reserve(files.size());
-  for(auto& path : files) {
-    auto range = readFileTimeRange(path, flags);
+  for(size_t i = 0; i < files.size(); ++i) {
+    auto& path = files[i];
+    auto const& range = ranges[i];
     if(!range) {
       filtered.push_back(std::move(path));
       continue;
@@ -778,6 +839,48 @@ static Expression evaluate(Expression&& e) {
              std::vector<HrPoint> hrPoints;
              std::vector<double> rowTimestamps;
 
+             // Name-derived per-field facts, resolved once per field number (only messages of
+             // the target type reach the column code, so field numbers map to fixed names).
+             struct CachedColumn {
+               ColumnBuilder* column = nullptr;
+               bool isSport = false;
+               bool isDateTime = false;
+             };
+             std::array<CachedColumn, 256> mainColumns {};
+             std::map<std::pair<FIT_UINT8, FIT_UINT16>, ColumnBuilder*> subFieldColumns;
+             MessageTable* table = nullptr;
+             std::optional<FIT_UINT16> targetNum; // nullopt: unknown to the profile, match by name
+
+             void setTarget(std::string_view type) {
+               targetType = type;
+               table = &tables[std::string(type)];
+               if(auto const* profile = fit::Profile::GetMesg(std::string(type)))
+                 targetNum = profile->num;
+             }
+
+             bool isTarget(fit::Mesg& mesg) const {
+               return targetNum ? mesg.GetNum() == *targetNum : mesg.GetName() == targetType;
+             }
+
+             CachedColumn& mainColumnFor(fit::Field* field) {
+               auto& cached = mainColumns[field->GetNum()];
+               if(!cached.column) {
+                 auto name = field->GetName();
+                 cached.column = &table->columns[name];
+                 cached.isSport = name == "sport";
+                 cached.isDateTime = isDateTimeField(name);
+               }
+               return cached;
+             }
+
+             ColumnBuilder& subFieldColumnFor(fit::Field* field, FIT_UINT16 subFieldIndex,
+                                              fit::Profile::SUBFIELD const* subFieldProfile) {
+               auto& column = subFieldColumns[{field->GetNum(), subFieldIndex}];
+               if(!column)
+                 column = &table->columns[std::string(subFieldProfile->name)];
+               return *column;
+             }
+
              void addNumericValue(ColumnBuilder& column, fit::FieldBase* field,
                                   FIT_UINT16 subFieldIndex = FIT_SUBFIELD_INDEX_MAIN_FIELD) {
                if(flags.apply_scale_and_offset)
@@ -788,7 +891,7 @@ static Expression evaluate(Expression&& e) {
 
              void OnMesg(fit::Mesg& mesg) override {
                // Collect HR messages when merging heart rates.
-               if(flags.merge_heart_rates && mesg.GetName() == "hr") {
+               if(flags.merge_heart_rates && mesg.GetNum() == FIT_MESG_NUM_HR) {
                  auto* tsField = mesg.GetField("timestamp");
                  auto* bpmField = mesg.GetField("filtered_bpm");
                  if(tsField && tsField->IsValueValid() && bpmField && bpmField->IsValueValid())
@@ -796,10 +899,8 @@ static Expression evaluate(Expression&& e) {
                  return;
                }
 
-               if(mesg.GetName() != targetType)
+               if(!isTarget(mesg))
                  return;
-
-               auto& table = tables[mesg.GetName()];
 
                // Stash this row's timestamp for HR interpolation later.
                if(flags.merge_heart_rates) {
@@ -813,11 +914,12 @@ static Expression evaluate(Expression&& e) {
                  if(!field || !field->IsValid() || !field->IsValueValid())
                    continue;
 
-                 auto& column = table.columns[field->GetName()];
-                 while(column.committedRows < table.rowCount)
+                 auto& cached = mainColumnFor(field);
+                 auto& column = *cached.column;
+                 while(column.committedRows < table->rowCount)
                    column.add(Symbol("NULL"));
 
-                 if(field->GetName() == "sport") {
+                 if(cached.isSport) {
                    column.add(fitSportName(static_cast<int>(field->GetFLOAT64Value())));
                  } else {
                    switch(field->GetType()) {
@@ -833,7 +935,7 @@ static Expression evaluate(Expression&& e) {
                    default: {
                      double rawVal = flags.apply_scale_and_offset ? field->GetFLOAT64Value()
                                                                   : field->GetRawValue();
-                     if(flags.convert_datetimes_to_dates && isDateTimeField(field->GetName()) &&
+                     if(flags.convert_datetimes_to_dates && cached.isDateTime &&
                         rawVal >= kFitDateTimeMin)
                        column.add(rawVal + kFitEpochOffset);
                      else
@@ -849,9 +951,8 @@ static Expression evaluate(Expression&& e) {
                    if(activeSubField != FIT_SUBFIELD_INDEX_MAIN_FIELD) {
                      auto const* subFieldProfile = field->GetSubField(activeSubField);
                      if(subFieldProfile && field->IsValueValid(0, activeSubField)) {
-                       std::string subFieldName(subFieldProfile->name);
-                       auto& sfColumn = table.columns[subFieldName];
-                       while(sfColumn.committedRows < table.rowCount)
+                       auto& sfColumn = subFieldColumnFor(field, activeSubField, subFieldProfile);
+                       while(sfColumn.committedRows < table->rowCount)
                          sfColumn.add(Symbol("NULL"));
                        addNumericValue(sfColumn, field, activeSubField);
                      }
@@ -859,64 +960,29 @@ static Expression evaluate(Expression&& e) {
                  }
                }
 
-               table.rowCount++;
-               for(auto& [_, column] : table.columns)
-                 if(column.committedRows < table.rowCount)
+               table->rowCount++;
+               for(auto& [_, column] : table->columns)
+                 if(column.committedRows < table->rowCount)
                    column.add(Symbol("NULL"));
              }
            };
 
-           unsigned int hwc = std::thread::hardware_concurrency();
-           if(hwc == 0)
-             hwc = 1;
-           unsigned int numWorkers =
-               std::min<unsigned int>(hwc, static_cast<unsigned int>(filePaths.size()));
+           auto const mesgFilter = flags.merge_heart_rates
+                                       ? mesgFilterFor({std::string(msgType), "hr"})
+                                       : mesgFilterFor({std::string(msgType)});
 
-           std::vector<FitDataListener> listeners(numWorkers);
+           // One listener per worker; rows are merged in worker order below.
+           std::vector<FitDataListener> listeners(workerCount(filePaths.size()));
            for(auto& l : listeners) {
-             l.targetType = msgType;
+             l.setTarget(msgType);
              l.flags = flags;
            }
-           std::vector<std::optional<std::string>> workerErrors(numWorkers);
+           std::vector<std::optional<std::string>> fileErrors(filePaths.size());
+           parallelFor(filePaths.size(), [&](size_t worker, size_t i) {
+             fileErrors[i] = decodeFile(filePaths[i], listeners[worker], flags, mesgFilter);
+           });
 
-           {
-             std::atomic<size_t> nextFileIdx {0};
-             std::vector<std::thread> workers;
-             workers.reserve(numWorkers);
-             for(unsigned int w = 0; w < numWorkers; ++w) {
-               workers.emplace_back([&, w]() {
-                 auto& listener = listeners[w];
-                 size_t i;
-                 while((i = nextFileIdx.fetch_add(1, std::memory_order_relaxed)) <
-                       filePaths.size()) {
-                   auto const& filePath = filePaths[i];
-                   auto file = std::fstream(filePath, std::ios::in | std::ios::binary);
-                   if(!file.is_open()) {
-                     workerErrors[w] = "Load::error: cannot open file: "s + filePath.string();
-                     return;
-                   }
-                   try {
-                     fit::Decode decode;
-                     if(!flags.expand_components)
-                       decode.SuppressComponentExpansion();
-                     if(!flags.enable_crc_check)
-                       decode.SkipHeader();
-                     decode.Read(file, listener);
-                   } catch(fit::RuntimeException const& e) {
-                     workerErrors[w] = "Load::error: "s + e.what();
-                     return;
-                   } catch(...) {
-                     workerErrors[w] = "Load::error: unknown exception during decode"s;
-                     return;
-                   }
-                 }
-               });
-             }
-             for(auto& t : workers)
-               t.join();
-           }
-
-           for(auto& e : workerErrors)
+           for(auto& e : fileErrors)
              if(e)
                return *e;
 
@@ -1091,25 +1157,19 @@ static Expression evaluate(Expression&& e) {
                column.add(Symbol("NULL"));
            };
 
-           for(auto const& filePath : filePaths) {
-             auto file = std::fstream(filePath, std::ios::in | std::ios::binary);
-             if(!file.is_open())
-               return "Load::error: cannot open file: "s + filePath.string();
-             SummaryListener summaryListener;
-             summaryListener.flags = flags;
-             try {
-               fit::Decode decode;
-               summaryListener.decode = &decode;
-               if(!flags.expand_components)
-                 decode.SuppressComponentExpansion();
-               if(!flags.enable_crc_check)
-                 decode.SkipHeader();
-               decode.Read(file, summaryListener);
-             } catch(fit::RuntimeException const& e) {
-               return "Load::error: "s + e.what();
-             } catch(...) {
-               return "Load::error: unknown exception during decode"s;
-             }
+           // Decode in parallel into per-file slots; rows (and the first error) stay in file order.
+           std::vector<SummaryListener> summaries(filePaths.size());
+           std::vector<std::optional<std::string>> errors(filePaths.size());
+           parallelFor(filePaths.size(), [&](size_t, size_t i) {
+             summaries[i].flags = flags;
+             errors[i] = decodeFile(filePaths[i], summaries[i], flags, summaryMesgFilter());
+           });
+
+           for(size_t i = 0; i < filePaths.size(); ++i) {
+             if(errors[i])
+               return std::move(*errors[i]);
+             auto const& filePath = filePaths[i];
+             auto const& summaryListener = summaries[i];
 
              fileColumn.add(filePath.filename().string());
              addOptionalDouble(timeCreatedColumn, summaryListener.timeCreated);
