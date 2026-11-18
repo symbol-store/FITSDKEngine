@@ -48,7 +48,8 @@ ExternalProject_Add(FITSDK
   PATCH_COMMAND patch -p1 -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/0001-noexcept-moves.patch &&
                 patch -p1 -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/0002-move-on-decode-and-mesgdef-by-ref.patch &&
                 patch -p1 -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/0003-reserve-fields-vector.patch &&
-                patch -p1 -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/0004-mesg-filter.patch
+                patch -p1 -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/0004-mesg-filter.patch &&
+                patch -p1 -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/0005-skip-filtered-messages.patch
   CONFIGURE_COMMAND ""
   BUILD_COMMAND ""
   INSTALL_COMMAND ""

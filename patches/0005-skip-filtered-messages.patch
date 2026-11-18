@@ -1,0 +1,278 @@
+--- a/src/fit_decode.cpp
++++ b/src/fit_decode.cpp
+@@ -39,6 +39,7 @@ Decode::Decode()
+         localMesgDefs[i].SetLocalNum((FIT_UINT8) i);
+     }
+ 
++    skipIndex = 0;
+     headerException = "";
+     streamIsComplete = FIT_TRUE;
+     skipHeader = FIT_FALSE;
+@@ -117,6 +118,7 @@ FIT_BOOL Decode::CheckIntegrity(std::istream &file)
+                     case RETURN_CONTINUE:
+                     case RETURN_MESG:
+                     case RETURN_MESG_DEF:
++                    case RETURN_MESG_SKIPPED:
+                         break;
+ 
+                     case RETURN_END_OF_FILE:
+@@ -261,6 +263,7 @@ FIT_BOOL Decode::Resume(void)
+ 
+             switch (decodeReturn) {
+                 case RETURN_CONTINUE:
++                case RETURN_MESG_SKIPPED:
+                     break;
+ 
+                 case RETURN_MESG:
+@@ -348,7 +351,7 @@ FIT_BOOL Decode::Resume(void)
+     {
+         // If stream is not yet complete caller can resume() when there is more data
+         // or decide there was an error.
+-        if ((decodeReturn == RETURN_MESG) || (decodeReturn == RETURN_MESG_DEF))
++        if ((decodeReturn == RETURN_MESG) || (decodeReturn == RETURN_MESG_DEF) || (decodeReturn == RETURN_MESG_SKIPPED))
+         {
+             // Our stream ended on a complete message, maybe we are done decoding.
+             return FIT_TRUE;
+@@ -364,7 +367,7 @@ FIT_BOOL Decode::Resume(void)
+         // (unless incomplete stream option above was also used)
+     else
+     {
+-        if ((decodeReturn == RETURN_MESG) || (decodeReturn == RETURN_MESG_DEF))
++        if ((decodeReturn == RETURN_MESG) || (decodeReturn == RETURN_MESG_DEF) || (decodeReturn == RETURN_MESG_SKIPPED))
+         {
+             // Our stream ended on a complete message, we are done decoding.
+             return FIT_TRUE;
+@@ -579,12 +582,10 @@ Decode::RETURN Decode::ReadByte(FIT_UINT8 data)
+ 
+             if (fileBytesLeft > 1) {
+                 if ((data & FIT_HDR_TIME_REC_BIT) != 0) {
+-                    Field timestampField = Field(Profile::MESG_RECORD, Profile::RECORD_MESG_TIMESTAMP);
+                     FIT_UINT8 timeOffset = data & FIT_HDR_TIME_OFFSET_MASK;
+ 
+                     timestamp += (timeOffset - lastTimeOffset) & FIT_HDR_TIME_OFFSET_MASK;
+                     lastTimeOffset = timeOffset;
+-                    timestampField.SetUINT32Value(timestamp);
+ 
+                     localMesgIndex = (data & FIT_HDR_TIME_TYPE_MASK) >> FIT_HDR_TIME_TYPE_SHIFT;
+ 
+@@ -595,6 +596,12 @@ Decode::RETURN Decode::ReadByte(FIT_UINT8 data)
+                         throw(RuntimeException(message.str()));
+                     }
+ 
++                    if (skipPlans[localMesgIndex].skip)
++                        return BeginSkip();
++
++                    Field timestampField = Field(Profile::MESG_RECORD, Profile::RECORD_MESG_TIMESTAMP);
++                    timestampField.SetUINT32Value(timestamp);
++
+                     mesg = Mesg(localMesgDefs[localMesgIndex].GetNum());
+                     mesg.SetLocalNum(localMesgIndex);
+                     mesg.ReserveFields(localMesgDefs[localMesgIndex].GetFields().size() + 1);
+@@ -623,6 +630,9 @@ Decode::RETURN Decode::ReadByte(FIT_UINT8 data)
+                             throw(RuntimeException(message.str()));
+                         }
+ 
++                        if (skipPlans[localMesgIndex].skip)
++                            return BeginSkip();
++
+                         mesg = Mesg(localMesgDefs[localMesgIndex].GetNum());
+                         mesg.SetLocalNum(localMesgIndex);
+                         mesg.ReserveFields(localMesgDefs[localMesgIndex].GetFields().size());
+@@ -695,7 +705,7 @@ Decode::RETURN Decode::ReadByte(FIT_UINT8 data)
+                 else
+                 {
+                     state = STATE_RECORD;
+-                    return RETURN_MESG_DEF;
++                    return EndMesgDefinition();
+                 }
+             }
+             else
+@@ -735,7 +745,7 @@ Decode::RETURN Decode::ReadByte(FIT_UINT8 data)
+                 else
+                 {
+                     state = STATE_RECORD;
+-                    return RETURN_MESG_DEF;
++                    return EndMesgDefinition();
+                 }
+             }
+             else
+@@ -751,7 +761,7 @@ Decode::RETURN Decode::ReadByte(FIT_UINT8 data)
+             if (numFields == 0)
+             {
+                 state = STATE_RECORD;
+-                return RETURN_MESG_DEF;
++                return EndMesgDefinition();
+             }
+ 
+             state = STATE_DEV_FIELD_NUM;
+@@ -794,7 +804,7 @@ Decode::RETURN Decode::ReadByte(FIT_UINT8 data)
+             if (++fieldIndex >= numFields)
+             {
+                 state = STATE_RECORD;
+-                return RETURN_MESG_DEF;
++                return EndMesgDefinition();
+             }
+ 
+             state = STATE_DEV_FIELD_NUM;
+@@ -978,6 +988,23 @@ Decode::RETURN Decode::ReadByte(FIT_UINT8 data)
+             break;
+         }
+ 
++        case STATE_SKIP:
++            ConsumeSkipped(&data, 1);
++
++            if (skipIndex < skipPlans[localMesgIndex].size)
++                break;
++
++            if (skipPlans[localMesgIndex].timestampOffset >= 0)
++            {
++                // Keep the compressed timestamp reference in sync, as decoding the field would.
++                UpdateEndianness(FIT_BASE_TYPE_UINT32, 4);
++                timestamp = ((FIT_UINT32)fieldData[3] << 24) | ((FIT_UINT32)fieldData[2] << 16) | ((FIT_UINT32)fieldData[1] << 8) | (FIT_UINT32)fieldData[0];
++                lastTimeOffset = (FIT_UINT8)(timestamp & FIT_HDR_TIME_OFFSET_MASK);
++            }
++
++            state = STATE_RECORD;
++            return RETURN_MESG_SKIPPED;
++
+         default:
+             break;
+     }
+@@ -985,6 +1012,72 @@ Decode::RETURN Decode::ReadByte(FIT_UINT8 data)
+     return RETURN_CONTINUE;
+ }
+ 
++Decode::RETURN Decode::EndMesgDefinition(void)
++{
++    const MesgDefinition& defn = localMesgDefs[localMesgIndex];
++    SkipPlan& plan = skipPlans[localMesgIndex];
++
++    plan = SkipPlan();
++
++    if (IsMesgWanted(defn.GetNum()))
++        return RETURN_MESG_DEF;
++
++    plan.skip = FIT_TRUE;
++
++    for (const FieldDefinition& fieldDefn : defn.GetFields())
++    {
++        if (fieldDefn.GetNum() == FIT_FIELD_NUM_TIMESTAMP)
++        {
++            // Decoding the timestamp updates the compressed timestamp reference. Only the
++            // common uint32 encoding is extracted while skipping; anything else is decoded.
++            if (Field(defn.GetNum(), FIT_FIELD_NUM_TIMESTAMP).IsValid())
++            {
++                if ((fieldDefn.GetType() == FIT_BASE_TYPE_UINT32) && (fieldDefn.GetSize() == 4))
++                    plan.timestampOffset = (FIT_SINT32)plan.size;
++                else
++                    plan.skip = FIT_FALSE;
++            }
++        }
++
++        plan.size += fieldDefn.GetSize();
++    }
++
++    // Developer fields follow the regular fields in the payload.
++    plan.size += defn.GetDeveloperFieldTotalSize();
++
++    return RETURN_MESG_DEF;
++}
++
++// Advances through a skipped payload, keeping the bytes of its timestamp field (if any)
++// in fieldData so the compressed timestamp reference can be updated at the end.
++void Decode::ConsumeSkipped(const FIT_UINT8* data, FIT_UINT32 count)
++{
++    FIT_SINT32 timestampOffset = skipPlans[localMesgIndex].timestampOffset;
++
++    if (timestampOffset >= 0)
++    {
++        for (FIT_UINT32 i = 0; i < count; i++)
++        {
++            FIT_SINT32 timestampByte = (FIT_SINT32)(skipIndex + i) - timestampOffset;
++            if ((timestampByte >= 0) && (timestampByte < 4))
++                fieldData[timestampByte] = data[i];
++        }
++    }
++
++    skipIndex += count;
++}
++
++Decode::RETURN Decode::BeginSkip(void)
++{
++    skipIndex = 0;
++
++    if (skipPlans[localMesgIndex].size == 0)
++        return RETURN_MESG_SKIPPED;
++
++    state = STATE_SKIP;
++    return RETURN_CONTINUE;
++}
++
+ void Decode::SuppressComponentExpansion(void)
+ {
+     suppressComponentExpansion = FIT_TRUE;
+--- a/src/fit_decode.hpp
++++ b/src/fit_decode.hpp
+@@ -114,11 +114,14 @@ public:
+     //    mesgFilter              Optional message filter (see below)
+     // Returns true if finished read file, otherwise false if decoding is paused.
+     //
+-    // A non-empty mesgFilter restricts the messages passed to the listener to
+-    // the listed global message numbers for this read (including any Resume
+-    // of it). developer_data_id and field_description messages are always
+-    // passed on because later developer fields depend on them. An empty
+-    // filter passes on all messages.
++    // A non-empty mesgFilter restricts decoding to the listed global message
++    // numbers for this read (including any Resume of it). Messages of any
++    // other type are not passed to the listener and, where possible, their
++    // payload is skipped without being decoded. developer_data_id and
++    // field_description messages are always decoded because later developer
++    // fields depend on them, and timestamps of skipped messages are still
++    // tracked for compressed timestamp headers. An empty filter decodes all
++    // messages.
+     ///////////////////////////////////////////////////////////////////////
+ 
+ 
+@@ -166,6 +169,7 @@ private:
+         STATE_FIELD_DATA,
+         STATE_DEV_FIELD_DATA,
+         STATE_FILE_CRC_HIGH,
++        STATE_SKIP,
+         STATES
+     } STATE;
+ 
+@@ -174,6 +178,7 @@ private:
+         RETURN_CONTINUE,
+         RETURN_MESG,
+         RETURN_MESG_DEF,
++        RETURN_MESG_SKIPPED,
+         RETURN_END_OF_FILE,
+         RETURN_ERROR,
+         RETURNS
+@@ -213,7 +218,16 @@ private:
+     FIT_BOOL streamIsComplete;
+     FIT_BOOL invalidDataSize;
+     FIT_BOOL suppressComponentExpansion;
++    struct SkipPlan
++    {
++        FIT_BOOL skip = FIT_FALSE;
++        FIT_UINT32 size = 0;           // Payload bytes, including developer fields.
++        FIT_SINT32 timestampOffset = -1; // Offset of a uint32 timestamp field, -1 if none.
++    };
++
+     std::vector<FIT_UINT16> mesgFilter; // Filter of the current Read; empty means no filter.
++    SkipPlan skipPlans[FIT_MAX_LOCAL_MESGS];
++    FIT_UINT32 skipIndex;
+     FIT_UINT32 currentByteOffset;
+     std::unordered_map<FIT_UINT8, DeveloperDataIdMesg> developers;
+     std::unordered_map<FIT_UINT8, std::unordered_map<FIT_UINT8, FieldDescriptionMesg>> descriptions;
+@@ -226,6 +240,9 @@ private:
+     void InitRead(std::istream &file, FIT_BOOL startOfFile);
+     void UpdateEndianness(FIT_UINT8 type, FIT_UINT8 size);
+     RETURN ReadByte(FIT_UINT8 data);
++    RETURN EndMesgDefinition(void);
++    RETURN BeginSkip(void);
++    void ConsumeSkipped(const FIT_UINT8* data, FIT_UINT32 count);
+     FIT_BOOL IsMesgWanted(const FIT_UINT16 mesgNum) const;
+     void ExpandComponents(Field* containingField, const Profile::FIELD_COMPONENT* components, FIT_UINT16 numComponents);
+     FIT_BOOL Read(std::istream* file);
