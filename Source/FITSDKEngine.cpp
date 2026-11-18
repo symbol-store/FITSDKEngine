@@ -17,6 +17,7 @@
 #include <fstream>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -207,57 +208,6 @@ static Symbol fitSportName(int sport) {
     return Symbol("Sport" + std::to_string(sport));
   }
 }
-
-struct ColumnBuilder {
-  ExpressionSpanArguments spans;
-  std::variant<std::vector<double>, std::vector<std::string>, std::vector<Symbol>> buffer;
-  size_t committedRows = 0;
-
-  void flush() {
-    std::visit(
-        [this](auto& vec) {
-          if(!vec.empty())
-            spans.push_back(Span<typename std::decay_t<decltype(vec)>::value_type>(std::move(vec)));
-        },
-        buffer);
-  }
-
-  template <typename V> void add(V&& value) {
-    using VecType = std::vector<std::decay_t<V>>;
-    if(!std::holds_alternative<VecType>(buffer)) {
-      flush();
-      buffer = VecType {};
-    }
-    std::get<VecType>(buffer).push_back(std::forward<V>(value));
-    committedRows++;
-  }
-
-  void appendFrom(ColumnBuilder&& other) {
-    other.flush();
-    spans.reserve(spans.size() + other.spans.size());
-    for(auto& s : other.spans)
-      spans.push_back(std::move(s));
-    committedRows += other.committedRows;
-  }
-
-  void appendNulls(size_t n) {
-    if(n == 0)
-      return;
-    flush();
-    spans.push_back(Span<Symbol>(std::vector<Symbol>(n, Symbol("NULL"))));
-    committedRows += n;
-  }
-
-  ExpressionSpanArguments build() && {
-    flush();
-    return std::move(spans);
-  }
-};
-
-struct MessageTable {
-  size_t rowCount = 0;
-  std::map<std::string, ColumnBuilder> columns;
-};
 
 // A table built row by row and emitted shape-wise partitioned (Mohr-Daurat et al., PVLDB
 // 17(11)): rows are grouped by their shape, i.e. the atom type of each column, and every
@@ -1027,25 +977,23 @@ static Expression evaluate(Expression&& e) {
            struct FitDataListener : fit::MesgListener {
              std::string_view targetType;
              ParseFlags flags;
-             std::unordered_map<std::string, MessageTable> tables;
+             ShapeWiseTable table;
              std::vector<HrPoint> hrPoints;
-             std::vector<double> rowTimestamps;
 
              // Name-derived per-field facts, resolved once per field number (only messages of
              // the target type reach the column code, so field numbers map to fixed names).
              struct CachedColumn {
-               ColumnBuilder* column = nullptr;
+               bool resolved = false;
+               std::optional<size_t> column; // nullopt: skipped (heart_rate when merging)
                bool isSport = false;
                bool isDateTime = false;
              };
              std::array<CachedColumn, 256> mainColumns {};
-             std::map<std::pair<FIT_UINT8, FIT_UINT16>, ColumnBuilder*> subFieldColumns;
-             MessageTable* table = nullptr;
+             std::map<std::pair<FIT_UINT8, FIT_UINT16>, size_t> subFieldColumns;
              std::optional<FIT_UINT16> targetNum; // nullopt: unknown to the profile, match by name
 
              void setTarget(std::string_view type) {
                targetType = type;
-               table = &tables[std::string(type)];
                if(auto const* profile = fit::Profile::GetMesg(std::string(type)))
                  targetNum = profile->num;
              }
@@ -1056,29 +1004,24 @@ static Expression evaluate(Expression&& e) {
 
              CachedColumn& mainColumnFor(fit::Field* field) {
                auto& cached = mainColumns[field->GetNum()];
-               if(!cached.column) {
+               if(!cached.resolved) {
+                 cached.resolved = true;
                  auto name = field->GetName();
-                 cached.column = &table->columns[name];
+                 // The heart_rate column is interpolated from hr messages instead.
+                 if(!(flags.merge_heart_rates && name == "heart_rate"))
+                   cached.column = table.column(name);
                  cached.isSport = name == "sport";
                  cached.isDateTime = isDateTimeField(name);
                }
                return cached;
              }
 
-             ColumnBuilder& subFieldColumnFor(fit::Field* field, FIT_UINT16 subFieldIndex,
-                                              fit::Profile::SUBFIELD const* subFieldProfile) {
-               auto& column = subFieldColumns[{field->GetNum(), subFieldIndex}];
-               if(!column)
-                 column = &table->columns[std::string(subFieldProfile->name)];
-               return *column;
-             }
-
-             void addNumericValue(ColumnBuilder& column, fit::FieldBase* field,
-                                  FIT_UINT16 subFieldIndex = FIT_SUBFIELD_INDEX_MAIN_FIELD) {
-               if(flags.apply_scale_and_offset)
-                 column.add(field->GetFLOAT64Value(0, subFieldIndex));
-               else
-                 column.add(field->GetRawValue());
+             size_t subFieldColumnFor(fit::Field* field, FIT_UINT16 subFieldIndex,
+                                      fit::Profile::SUBFIELD const* subFieldProfile) {
+               auto [it, inserted] = subFieldColumns.try_emplace({field->GetNum(), subFieldIndex});
+               if(inserted)
+                 it->second = table.column(std::string(subFieldProfile->name));
+               return it->second;
              }
 
              void OnMesg(fit::Mesg& mesg) override {
@@ -1087,19 +1030,13 @@ static Expression evaluate(Expression&& e) {
                  auto* tsField = mesg.GetField("timestamp");
                  auto* bpmField = mesg.GetField("filtered_bpm");
                  if(tsField && tsField->IsValueValid() && bpmField && bpmField->IsValueValid())
-                   hrPoints.push_back({tsField->GetFLOAT64Value(), bpmField->GetFLOAT64Value()});
+                   hrPoints.push_back({convertDateTime(tsField->GetFLOAT64Value(), flags),
+                                       bpmField->GetFLOAT64Value()});
                  return;
                }
 
                if(!isTarget(mesg))
                  return;
-
-               // Stash this row's timestamp for HR interpolation later.
-               if(flags.merge_heart_rates) {
-                 auto* tsField = mesg.GetField("timestamp");
-                 rowTimestamps.push_back(
-                     (tsField && tsField->IsValueValid()) ? tsField->GetFLOAT64Value() : -1.0);
-               }
 
                for(FIT_UINT16 i = 0; i < (FIT_UINT16)mesg.GetNumFields(); i++) {
                  auto* field = mesg.GetFieldByIndex(i);
@@ -1107,17 +1044,17 @@ static Expression evaluate(Expression&& e) {
                    continue;
 
                  auto& cached = mainColumnFor(field);
-                 auto& column = *cached.column;
-                 while(column.committedRows < table->rowCount)
-                   column.add(Symbol("NULL"));
+                 if(!cached.column)
+                   continue;
+                 auto column = *cached.column;
 
                  if(cached.isSport) {
-                   column.add(fitSportName(static_cast<int>(field->GetFLOAT64Value())));
+                   table.set(column, fitSportName(static_cast<int>(field->GetFLOAT64Value())));
                  } else {
                    switch(field->GetType()) {
                    case FIT_BASE_TYPE_STRING: {
                      auto const& wstr = field->GetSTRINGValue();
-                     column.add(std::string(wstr.begin(), wstr.end()));
+                     table.set(column, std::string(wstr.begin(), wstr.end()));
                      break;
                    }
                    case FIT_BASE_TYPE_ENDIAN_FLAG:
@@ -1127,11 +1064,7 @@ static Expression evaluate(Expression&& e) {
                    default: {
                      double rawVal = flags.apply_scale_and_offset ? field->GetFLOAT64Value()
                                                                   : field->GetRawValue();
-                     if(flags.convert_datetimes_to_dates && cached.isDateTime &&
-                        rawVal >= kFitDateTimeMin)
-                       column.add(rawVal + kFitEpochOffset);
-                     else
-                       column.add(rawVal);
+                     table.set(column, cached.isDateTime ? convertDateTime(rawVal, flags) : rawVal);
                      break;
                    }
                    }
@@ -1142,20 +1075,16 @@ static Expression evaluate(Expression&& e) {
                    FIT_UINT16 activeSubField = mesg.GetActiveSubFieldIndexByFieldIndex(i);
                    if(activeSubField != FIT_SUBFIELD_INDEX_MAIN_FIELD) {
                      auto const* subFieldProfile = field->GetSubField(activeSubField);
-                     if(subFieldProfile && field->IsValueValid(0, activeSubField)) {
-                       auto& sfColumn = subFieldColumnFor(field, activeSubField, subFieldProfile);
-                       while(sfColumn.committedRows < table->rowCount)
-                         sfColumn.add(Symbol("NULL"));
-                       addNumericValue(sfColumn, field, activeSubField);
-                     }
+                     if(subFieldProfile && field->IsValueValid(0, activeSubField))
+                       table.set(subFieldColumnFor(field, activeSubField, subFieldProfile),
+                                 flags.apply_scale_and_offset
+                                     ? field->GetFLOAT64Value(0, activeSubField)
+                                     : field->GetRawValue());
                    }
                  }
                }
 
-               table->rowCount++;
-               for(auto& [_, column] : table->columns)
-                 if(column.committedRows < table->rowCount)
-                   column.add(Symbol("NULL"));
+               table.endRow();
              }
            };
 
@@ -1178,97 +1107,55 @@ static Expression evaluate(Expression&& e) {
              if(e)
                return *e;
 
-           // std::map keeps the column order alphabetical, matching single-listener output.
-           std::map<std::string, ColumnBuilder> mergedColumns;
-           size_t mergedRowCount = 0;
-           auto msgTypeKey = std::string(msgType);
-           for(auto& l : listeners) {
-             auto it = l.tables.find(msgTypeKey);
-             if(it == l.tables.end())
-               continue;
-             mergedRowCount += it->second.rowCount;
-             for(auto const& [name, _] : it->second.columns) {
-               // Skip native heart_rate when interpolating — HR merge will write the column.
-               if(flags.merge_heart_rates && name == "heart_rate")
-                 continue;
-               mergedColumns.try_emplace(name);
-             }
-           }
-           for(auto& l : listeners) {
-             auto it = l.tables.find(msgTypeKey);
-             if(it == l.tables.end())
-               continue;
-             size_t lRows = it->second.rowCount;
-             for(auto& [name, target] : mergedColumns) {
-               auto colIt = it->second.columns.find(name);
-               if(colIt != it->second.columns.end())
-                 target.appendFrom(std::move(colIt->second));
-               else
-                 target.appendNulls(lRows);
-             }
+           std::vector<HrPoint> hrPoints;
+           if(flags.merge_heart_rates) {
+             size_t total = 0;
+             for(auto const& l : listeners)
+               total += l.hrPoints.size();
+             hrPoints.reserve(total);
+             for(auto& l : listeners)
+               hrPoints.insert(hrPoints.end(), l.hrPoints.begin(), l.hrPoints.end());
            }
 
-           if(mergedRowCount == 0) {
+           // Register the columns alphabetically first so the merged table emits them in that
+           // order; heart_rate is interpolated from the hr messages (if there are any).
+           std::set<std::string> columnNames;
+           for(auto& l : listeners)
+             columnNames.insert(l.table.columns().begin(), l.table.columns().end());
+           if(!hrPoints.empty())
+             columnNames.insert("heart_rate");
+           ShapeWiseTable merged;
+           for(auto const& name : columnNames)
+             merged.column(name);
+           for(auto& l : listeners)
+             merged.append(std::move(l.table));
+
+           if(merged.empty()) {
              if(filePaths.empty()) {
                auto emptyTable = "Table"_(ExpressionArguments {});
                if(plan.hasOtherFiles)
                  return wrapForMixedDirectory(std::string(path), std::move(emptyTable));
                return std::move(emptyTable);
              }
-             return "Load::error: message type not found: "s + msgTypeKey;
+             return "Load::error: message type not found: "s + std::string(msgType);
            }
 
-           // Merge heart rate data: nearest-neighbour interpolation by timestamp.
-           // rowTimestamps stays row-aligned with mergedColumns only because each
-           // listener appends its rows contiguously in the same worker-iteration order
-           // used here — keep those two loops in lockstep.
-           if(flags.merge_heart_rates) {
-             size_t hrPointTotal = 0, rowTsTotal = 0;
-             for(auto& l : listeners) {
-               hrPointTotal += l.hrPoints.size();
-               rowTsTotal += l.rowTimestamps.size();
-             }
-             std::vector<HrPoint> mergedHrPoints;
-             std::vector<double> mergedRowTimestamps;
-             mergedHrPoints.reserve(hrPointTotal);
-             mergedRowTimestamps.reserve(rowTsTotal);
-             for(auto& l : listeners) {
-               mergedHrPoints.insert(mergedHrPoints.end(), l.hrPoints.begin(), l.hrPoints.end());
-               mergedRowTimestamps.insert(mergedRowTimestamps.end(), l.rowTimestamps.begin(),
-                                          l.rowTimestamps.end());
-             }
-             if(!mergedHrPoints.empty()) {
-               std::ranges::sort(mergedHrPoints, {}, &HrPoint::timestamp);
-               ColumnBuilder hrColumn;
-               for(size_t row = 0; row < mergedRowCount; ++row) {
-                 double ts = (row < mergedRowTimestamps.size()) ? mergedRowTimestamps[row] : -1.0;
-                 if(ts < 0.0) {
-                   hrColumn.add(Symbol("NULL"));
-                   continue;
-                 }
-                 auto it = std::ranges::lower_bound(mergedHrPoints, ts, {}, &HrPoint::timestamp);
-                 double bpm;
-                 if(it == mergedHrPoints.end())
-                   bpm = mergedHrPoints.back().bpm;
-                 else if(it == mergedHrPoints.begin())
-                   bpm = it->bpm;
-                 else {
-                   auto prev = std::prev(it);
-                   bpm = (ts - prev->timestamp <= it->timestamp - ts) ? prev->bpm : it->bpm;
-                 }
-                 hrColumn.add(bpm);
-               }
-               mergedColumns["heart_rate"] = std::move(hrColumn);
-             }
+           // Merge heart rate data: nearest-neighbour interpolation by timestamp. Rows with a
+           // timestamp share partitions, so the derived column keeps partitions homogeneous.
+           if(!hrPoints.empty()) {
+             std::ranges::sort(hrPoints, {}, &HrPoint::timestamp);
+             merged.deriveColumn("heart_rate", "timestamp", [&](double ts) {
+               auto it = std::ranges::lower_bound(hrPoints, ts, {}, &HrPoint::timestamp);
+               if(it == hrPoints.end())
+                 return hrPoints.back().bpm;
+               if(it == hrPoints.begin())
+                 return it->bpm;
+               auto prev = std::prev(it);
+               return (ts - prev->timestamp <= it->timestamp - ts) ? prev->bpm : it->bpm;
+             });
            }
 
-
-           auto columns = ExpressionArguments {};
-           for(auto& [name, builder] : mergedColumns)
-             columns.emplace_back(
-                 ComplexExpression(Symbol(name), {}, {}, std::move(builder).build()));
-
-           auto table = "Table"_(std::move(columns));
+           auto table = "Table"_(std::move(merged).build());
            if(plan.hasOtherFiles)
              return wrapForMixedDirectory(std::string(path), std::move(table));
            return std::move(table);
