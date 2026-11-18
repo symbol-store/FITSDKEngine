@@ -1,0 +1,115 @@
+--- a/src/fit_crc.cpp
++++ b/src/fit_crc.cpp
+@@ -37,6 +37,34 @@ FIT_UINT16 CRC::Get16(FIT_UINT16 crc, FIT_UINT8 byte)
+    return crc;
+ }
+ 
++// Byte-at-a-time table for the same CRC-16 (reflected polynomial 0xA001) that Get16
++// computes a nibble at a time; used for bulk updates over skipped message payloads.
++static constexpr struct CRCByteTable
++{
++   FIT_UINT16 entries[256];
++
++   constexpr CRCByteTable() : entries()
++   {
++      for (int i = 0; i < 256; i++)
++      {
++         FIT_UINT16 crc = (FIT_UINT16)i;
++         for (int bit = 0; bit < 8; bit++)
++            crc = (crc & 1) ? (FIT_UINT16)((crc >> 1) ^ 0xA001) : (FIT_UINT16)(crc >> 1);
++         entries[i] = crc;
++      }
++   }
++} crcByteTable;
++
++FIT_UINT16 CRC::Update16(FIT_UINT16 crc, const void *data, FIT_UINT32 size)
++{
++   const FIT_BYTE *data_ptr = (const FIT_BYTE *)data;
++
++   while (size--)
++      crc = (FIT_UINT16)((crc >> 8) ^ crcByteTable.entries[(crc ^ *data_ptr++) & 0xFF]);
++
++   return crc;
++}
++
+ FIT_UINT16 CRC::Calc16(const volatile void *data, FIT_UINT32 size)
+ {
+    FIT_UINT16 crc = 0;
+--- a/src/fit_crc.hpp
++++ b/src/fit_crc.hpp
+@@ -23,6 +23,7 @@ class CRC
+    public:
+       static FIT_UINT16 Get16(FIT_UINT16 crc, FIT_UINT8 byte);
+       static FIT_UINT16 Calc16(const volatile void *data, FIT_UINT32 size);
++      static FIT_UINT16 Update16(FIT_UINT16 crc, const void *data, FIT_UINT32 size);
+ };
+ 
+ 
+--- a/src/fit_decode.cpp
++++ b/src/fit_decode.cpp
+@@ -259,6 +259,16 @@ FIT_BOOL Decode::Resume(void)
+             if (pause)
+                 return FIT_FALSE;
+ 
++            if (state == STATE_SKIP)
++            {
++                FIT_UINT32 skipped = SkipBulk((const FIT_UINT8*)&buffer[currentByteIndex], bytesRead - currentByteIndex);
++                currentByteIndex += skipped;
++                currentByteOffset += skipped;
++
++                if (currentByteIndex >= bytesRead)
++                    break;
++            }
++
+             decodeReturn = ReadByte((FIT_UINT8)buffer[currentByteIndex]);
+ 
+             switch (decodeReturn) {
+@@ -1067,6 +1077,29 @@ void Decode::ConsumeSkipped(const FIT_UINT8* data, FIT_UINT32 count)
+     skipIndex += count;
+ }
+ 
++// Consumes as much of a skipped payload as is available in one go, leaving the final
++// byte (and the file CRC) to ReadByte so message completion is handled in one place.
++FIT_UINT32 Decode::SkipBulk(const FIT_UINT8* data, FIT_UINT32 size)
++{
++    FIT_UINT32 count = skipPlans[localMesgIndex].size - skipIndex - 1;
++
++    if (count > size)
++        count = size;
++
++    if ((fileBytesLeft > 0) && (skipHeader == FIT_FALSE))
++    {
++        if (fileBytesLeft <= 2)
++            return 0;
++        if (count > fileBytesLeft - 2)
++            count = fileBytesLeft - 2;
++        crc = CRC::Update16(crc, data, count);
++        fileBytesLeft -= count;
++    }
++
++    ConsumeSkipped(data, count);
++    return count;
++}
++
+ Decode::RETURN Decode::BeginSkip(void)
+ {
+     skipIndex = 0;
+--- a/src/fit_decode.hpp
++++ b/src/fit_decode.hpp
+@@ -187,7 +187,7 @@ private:
+     static const FIT_UINT8 DevFieldNumOffset;
+     static const FIT_UINT8 DevFieldSizeOffset;
+     static const FIT_UINT8 DevFieldIndexOffset;
+-    static const FIT_UINT16 BufferSize = 512;
++    static const FIT_UINT16 BufferSize = 8192;
+ 
+     STATE state;
+     FIT_BOOL hasDevData;
+@@ -243,6 +243,7 @@ private:
+     RETURN EndMesgDefinition(void);
+     RETURN BeginSkip(void);
+     void ConsumeSkipped(const FIT_UINT8* data, FIT_UINT32 count);
++    FIT_UINT32 SkipBulk(const FIT_UINT8* data, FIT_UINT32 size);
+     FIT_BOOL IsMesgWanted(const FIT_UINT16 mesgNum) const;
+     void ExpandComponents(Field* containingField, const Profile::FIELD_COMPONENT* components, FIT_UINT16 numComponents);
+     FIT_BOOL Read(std::istream* file);
