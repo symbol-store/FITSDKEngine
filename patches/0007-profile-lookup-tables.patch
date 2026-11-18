@@ -1,0 +1,85 @@
+--- a/src/fit_profile.cpp
++++ b/src/fit_profile.cpp
+@@ -12,6 +12,11 @@
+ 
+ #include "fit_profile.hpp"
+ 
++#include <algorithm>
++#include <array>
++#include <iterator>
++#include <vector>
++
+ namespace fit
+ {
+ 
+@@ -3055,15 +3060,42 @@ const Profile::MESG Profile::mesgs[MESGS] =
+    { NULL, "pad", FIT_MESG_NUM_PAD, 0 },
+ };
+ 
+-const Profile::MESG* Profile::GetMesg(const FIT_UINT16 num)
++// Dense lookup tables replacing the linear scans in GetMesg/GetFieldIndex, which the
++// decoder hits for every field of every message. Built once, on first use; entries keep
++// the first match, like the scans they replace.
++struct ProfileLookup
+ {
+-    for (int i = 0; i < MESGS; i++)
++    FIT_UINT16 mesgIndexByNum[FIT_UINT16_INVALID + 1];
++    std::vector<std::array<FIT_UINT16, FIT_UINT8_INVALID + 1>> fieldIndexByNum;
++
++    ProfileLookup() : fieldIndexByNum(Profile::MESGS)
+     {
+-        if (mesgs[i].num == num)
+-            return &mesgs[i];
++        std::fill(std::begin(mesgIndexByNum), std::end(mesgIndexByNum), (FIT_UINT16)Profile::MESGS);
++        for (int i = Profile::MESGS - 1; i >= 0; i--)
++        {
++            const Profile::MESG& mesg = Profile::mesgs[i];
++            mesgIndexByNum[mesg.num] = (FIT_UINT16)i;
++            fieldIndexByNum[i].fill(FIT_UINT16_INVALID);
++            for (int j = mesg.numFields - 1; j >= 0; j--)
++                fieldIndexByNum[i][mesg.fields[j].num] = (FIT_UINT16)j;
++        }
+     }
+ 
+-    return NULL;
++    static const ProfileLookup& Get()
++    {
++        static const ProfileLookup lookup;
++        return lookup;
++    }
++};
++
++const Profile::MESG* Profile::GetMesg(const FIT_UINT16 num)
++{
++    FIT_UINT16 index = ProfileLookup::Get().mesgIndexByNum[num];
++
++    if (index == MESGS)
++        return NULL;
++
++    return &mesgs[index];
+ }
+ 
+ const Profile::MESG* Profile::GetMesg(const std::string& name)
+@@ -3079,18 +3111,13 @@ const Profile::MESG* Profile::GetMesg(const std::string& name)
+ 
+ const FIT_UINT16 Profile::GetFieldIndex(const FIT_UINT16 mesgNum, const FIT_UINT8 fieldNum)
+ {
+-    const MESG *mesg = GetMesg(mesgNum);
++    const ProfileLookup& lookup = ProfileLookup::Get();
++    FIT_UINT16 index = lookup.mesgIndexByNum[mesgNum];
+ 
+-    if (mesg == NULL)
++    if (index == MESGS)
+         return FIT_UINT16_INVALID;
+ 
+-    for (FIT_UINT16 i = 0; i < mesg->numFields; i++)
+-    {
+-        if (mesg->fields[i].num == fieldNum)
+-            return i;
+-    }
+-
+-    return FIT_UINT16_INVALID;
++    return lookup.fieldIndexByNum[index][fieldNum];
+ }
+ 
+ const FIT_UINT16 Profile::GetFieldIndex(const std::string& mesgName, const std::string& fieldName)

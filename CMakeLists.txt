@@ -50,7 +50,9 @@ ExternalProject_Add(FITSDK
                 patch -p1 -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/0003-reserve-fields-vector.patch &&
                 patch -p1 -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/0004-mesg-filter.patch &&
                 patch -p1 -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/0005-skip-filtered-messages.patch &&
-                patch -p1 -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/0006-bulk-skip-and-table-crc.patch
+                patch -p1 -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/0006-bulk-skip-and-table-crc.patch &&
+                patch -p1 -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/0007-profile-lookup-tables.patch &&
+                patch -p1 -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/0008-avoid-per-field-allocations.patch
   CONFIGURE_COMMAND ""
   BUILD_COMMAND ""
   INSTALL_COMMAND ""

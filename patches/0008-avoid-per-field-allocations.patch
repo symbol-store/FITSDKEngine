@@ -1,0 +1,218 @@
+--- a/src/fit_decode.cpp
++++ b/src/fit_decode.cpp
+@@ -612,7 +612,7 @@ Decode::RETURN Decode::ReadByte(FIT_UINT8 data)
+                     Field timestampField = Field(Profile::MESG_RECORD, Profile::RECORD_MESG_TIMESTAMP);
+                     timestampField.SetUINT32Value(timestamp);
+ 
+-                    mesg = Mesg(localMesgDefs[localMesgIndex].GetNum());
++                    mesg.Reset(localMesgDefs[localMesgIndex].GetNum());
+                     mesg.SetLocalNum(localMesgIndex);
+                     mesg.ReserveFields(localMesgDefs[localMesgIndex].GetFields().size() + 1);
+                     mesg.AddField(timestampField);
+@@ -643,7 +643,7 @@ Decode::RETURN Decode::ReadByte(FIT_UINT8 data)
+                         if (skipPlans[localMesgIndex].skip)
+                             return BeginSkip();
+ 
+-                        mesg = Mesg(localMesgDefs[localMesgIndex].GetNum());
++                        mesg.Reset(localMesgDefs[localMesgIndex].GetNum());
+                         mesg.SetLocalNum(localMesgIndex);
+                         mesg.ReserveFields(localMesgDefs[localMesgIndex].GetFields().size());
+ 
+--- a/src/fit_field_base.cpp
++++ b/src/fit_field_base.cpp
+@@ -1108,7 +1108,7 @@ FIT_BOOL FieldBase::IsValueValid( const FIT_UINT8 fieldArrayIndex, const FIT_UIN
+     {
+         FIT_UINT8 baseTypeSize = baseTypeSizes[type & FIT_BASE_TYPE_NUM_MASK];
+         const FIT_UINT8* invalid = baseTypeInvalids[type & FIT_BASE_TYPE_NUM_MASK];
+-        FIT_UINT8* data = new FIT_UINT8[baseTypeSize];
++        FIT_UINT8 data[sizeof(FIT_UINT64)]; // Largest base type.
+ 
+         FIT_BOOL readSuccess = GetMemoryValue( fieldArrayIndex, data, baseTypeSize );
+ 
+@@ -1117,7 +1117,6 @@ FIT_BOOL FieldBase::IsValueValid( const FIT_UINT8 fieldArrayIndex, const FIT_UIN
+         {
+             isValid = ( memcmp( invalid, data, baseTypeSize ) != 0 );
+         }
+-        delete[] data;
+     }
+ 
+     return isValid;
+--- a/src/fit_field_base.hpp
++++ b/src/fit_field_base.hpp
+@@ -14,6 +14,7 @@
+ #define FIELD_BASE_HPP
+ 
+ #include <cstdio>
++#include <cstring>
+ #include <iosfwd>
+ #include <string>
+ #include <vector>
+@@ -23,6 +24,132 @@
+ namespace fit
+ {
+ 
++// Byte storage for field values with the subset of the std::vector interface FieldBase
++// uses. Values up to InlineCapacity bytes (nearly all fields) live inline, so decoding a
++// field does not allocate.
++class FieldValueBytes
++{
++public:
++    typedef FIT_BYTE* iterator;
++    typedef const FIT_BYTE* const_iterator;
++
++    FieldValueBytes() noexcept : heap(NULL), count(0), capacity(InlineCapacity) {}
++    FieldValueBytes(const FieldValueBytes& other) : FieldValueBytes() { Assign(other.data(), other.count); }
++    FieldValueBytes(FieldValueBytes&& other) noexcept : FieldValueBytes() { Steal(other); }
++    ~FieldValueBytes() { delete[] heap; }
++
++    FieldValueBytes& operator=(const FieldValueBytes& other)
++    {
++        if (this != &other)
++            Assign(other.data(), other.count);
++        return *this;
++    }
++
++    FieldValueBytes& operator=(FieldValueBytes&& other) noexcept
++    {
++        if (this != &other)
++        {
++            delete[] heap;
++            heap = NULL;
++            count = 0;
++            capacity = InlineCapacity;
++            Steal(other);
++        }
++        return *this;
++    }
++
++    size_t size() const { return count; }
++    FIT_BYTE* data() { return heap ? heap : inlineBytes; }
++    const FIT_BYTE* data() const { return heap ? heap : inlineBytes; }
++    iterator begin() { return data(); }
++    iterator end() { return data() + count; }
++    const_iterator begin() const { return data(); }
++    const_iterator end() const { return data() + count; }
++    FIT_BYTE& operator[](size_t i) { return data()[i]; }
++    const FIT_BYTE& operator[](size_t i) const { return data()[i]; }
++    FIT_BYTE& back() { return data()[count - 1]; }
++    void clear() { count = 0; }
++
++    void resize(size_t n)
++    {
++        Reserve(n);
++        if (n > count)
++            std::memset(data() + count, 0, n - count);
++        count = (FIT_UINT32)n;
++    }
++
++    void push_back(FIT_BYTE value)
++    {
++        Reserve(count + 1);
++        data()[count++] = value;
++    }
++
++    iterator insert(iterator pos, FIT_BYTE value) { return insert(pos, &value, &value + 1); }
++
++    iterator insert(iterator pos, const FIT_BYTE* first, const FIT_BYTE* last)
++    {
++        size_t index = pos - data();
++        size_t n = last - first;
++        Reserve(count + n);
++        std::memmove(data() + index + n, data() + index, count - index);
++        std::memcpy(data() + index, first, n);
++        count += (FIT_UINT32)n;
++        return data() + index;
++    }
++
++    iterator erase(iterator first, iterator last)
++    {
++        size_t n = last - first;
++        std::memmove(first, last, end() - last);
++        count -= (FIT_UINT32)n;
++        return first;
++    }
++
++private:
++    static const FIT_UINT32 InlineCapacity = 16;
++
++    void Reserve(size_t n)
++    {
++        if (n <= capacity)
++            return;
++        FIT_UINT32 newCapacity = (FIT_UINT32)((n > 2 * (size_t)capacity) ? n : 2 * (size_t)capacity);
++        FIT_BYTE* newHeap = new FIT_BYTE[newCapacity];
++        std::memcpy(newHeap, data(), count);
++        delete[] heap;
++        heap = newHeap;
++        capacity = newCapacity;
++    }
++
++    void Assign(const FIT_BYTE* bytes, size_t n)
++    {
++        Reserve(n);
++        std::memmove(data(), bytes, n);
++        count = (FIT_UINT32)n;
++    }
++
++    void Steal(FieldValueBytes& other)
++    {
++        if (other.heap)
++        {
++            heap = other.heap;
++            capacity = other.capacity;
++            other.heap = NULL;
++            other.capacity = InlineCapacity;
++        }
++        else
++        {
++            std::memcpy(inlineBytes, other.inlineBytes, other.count);
++        }
++        count = other.count;
++        other.count = 0;
++    }
++
++    FIT_BYTE* heap;
++    FIT_UINT32 count;
++    FIT_UINT32 capacity;
++    FIT_BYTE inlineBytes[InlineCapacity];
++};
++
+ class FieldBase
+ {
+ public:
+@@ -128,7 +255,7 @@ private:
+     FIT_FLOAT64 GetRawValueInternal(const FIT_UINT8 fieldArrayIndex = 0) const;
+     static FIT_FLOAT64 Round(FIT_FLOAT64 value);
+ 
+-    std::vector<FIT_BYTE> values;
++    FieldValueBytes values;
+     std::vector<FIT_UINT8> stringIndexes;
+ };
+ 
+--- a/src/fit_mesg.cpp
++++ b/src/fit_mesg.cpp
+@@ -258,6 +258,14 @@ void Mesg::ReserveFields(std::size_t n)
+     fields.reserve(n);
+ }
+ 
++void Mesg::Reset(const FIT_UINT16 num)
++{
++    profile = Profile::GetMesg(num);
++    localNum = 0;
++    fields.clear();
++    devFields.clear();
++}
++
+ int Mesg::GetNumFields() const
+ {
+     return (int)fields.size();
+--- a/src/fit_mesg.hpp
++++ b/src/fit_mesg.hpp
+@@ -53,6 +53,7 @@ public:
+     void SetField(const Field& field);
+     void SetField(Field&& field);
+     void ReserveFields(std::size_t n);
++    void Reset(const FIT_UINT16 num); // Like *this = Mesg(num), but keeps the field storage.
+     void SetFields(const Mesg& mesg);
+     int GetNumFields() const;
+     int GetNumDevFields() const;
