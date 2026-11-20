@@ -16,8 +16,11 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <numeric>
 #include <optional>
+#include <ranges>
 #include <set>
+#include <span>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -454,15 +457,17 @@ static std::vector<FIT_UINT16> const& summaryMesgFilter() {
 }
 
 // Decode one file into `listener` with the parse flags applied. Listeners with a `decode`
-// member (to Pause() once they have what they need) get the decoder. Returns the Load error
-// message on failure.
+// member (to Pause() once they have what they need) get the decoder. Returns the reason
+// for a failure as an expression.
 template <typename Listener>
-static std::optional<std::string> decodeFile(std::filesystem::path const& filePath,
-                                             Listener& listener, ParseFlags const& flags,
-                                             std::vector<FIT_UINT16> const& mesgFilter) {
+static std::optional<Expression> decodeFile(std::filesystem::path const& filePath,
+                                            Listener& listener, ParseFlags const& flags,
+                                            std::vector<FIT_UINT16> const& mesgFilter) {
   auto file = std::fstream(filePath, std::ios::in | std::ios::binary);
   if(!file.is_open())
-    return "Load::error: cannot open file: "s + filePath.string();
+    return "FileNotOpened"_(filePath.string());
+  // fit::Decode reports a malformed file only by throwing, and an exception must not leave the
+  // worker thread that runs this function, so the SDK's exceptions are caught here.
   try {
     fit::Decode decode;
     if constexpr(requires { listener.decode; })
@@ -473,9 +478,9 @@ static std::optional<std::string> decodeFile(std::filesystem::path const& filePa
       decode.SkipHeader();
     decode.Read(file, listener, mesgFilter);
   } catch(fit::RuntimeException const& e) {
-    return "Load::error: "s + e.what();
+    return "FileNotDecoded"_(filePath.string(), std::string(e.what()));
   } catch(...) {
-    return "Load::error: unknown exception during decode"s;
+    return "FileNotDecoded"_(filePath.string(), "unknown exception during decode"s);
   }
   return std::nullopt;
 }
@@ -515,44 +520,34 @@ static std::optional<double> tryAsDouble(Expression const& e) {
       e);
 }
 
-static ParseFlags parseFlagsFrom(ExpressionArguments& dynamics, size_t startIndex) {
+static ParseFlags parseFlagsFrom(ExpressionArguments const& dynamics, size_t startIndex) {
   ParseFlags flags;
-  for(size_t i = startIndex; i < dynamics.size(); ++i) {
-    auto* flagExpr = std::get_if<ComplexExpression>(&dynamics[i]);
-    if(!flagExpr)
-      continue;
-    auto [flagHead, flagStatics, flagArgs, flagSpans] = std::move(*flagExpr).decompose();
-    auto const& flagName = flagHead.getName();
-
+  auto applyFlag = [&flags](ComplexExpression const& flagExpr) {
+    auto const& flagName = flagExpr.getHead().getName();
+    auto const& flagArgs = flagExpr.getDynamicArguments();
+    auto const value = flagArgs.empty() ? std::nullopt : tryAsDouble(flagArgs[0]);
     if(flagName == "timestamp_min" || flagName == "timestamp_max") {
-      auto value = flagArgs.empty() ? std::nullopt : tryAsDouble(flagArgs[0]);
-      if(!value)
-        continue;
-      if(flagName == "timestamp_min")
-        flags.timestamp_min = *value;
-      else
-        flags.timestamp_max = *value;
-      continue;
+      if(value)
+        (flagName == "timestamp_min" ? flags.timestamp_min : flags.timestamp_max) = *value;
+      return;
     }
-
-    bool value = true;
-    if(!flagArgs.empty()) {
-      if(auto const v = tryAsDouble(flagArgs[0]))
-        value = (*v != 0.0);
-    }
+    bool const enabled = value.value_or(1.0) != 0.0;
     if(flagName == "apply_scale_and_offset")
-      flags.apply_scale_and_offset = value;
+      flags.apply_scale_and_offset = enabled;
     else if(flagName == "expand_components")
-      flags.expand_components = value;
+      flags.expand_components = enabled;
     else if(flagName == "expand_sub_fields")
-      flags.expand_sub_fields = value;
+      flags.expand_sub_fields = enabled;
     else if(flagName == "convert_datetimes_to_dates")
-      flags.convert_datetimes_to_dates = value;
+      flags.convert_datetimes_to_dates = enabled;
     else if(flagName == "merge_heart_rates")
-      flags.merge_heart_rates = value;
+      flags.merge_heart_rates = enabled;
     else if(flagName == "enable_crc_check")
-      flags.enable_crc_check = value;
-  }
+      flags.enable_crc_check = enabled;
+  };
+  for(auto const& argument : dynamics | std::views::drop(startIndex))
+    if(auto const* flagExpr = std::get_if<ComplexExpression>(&argument))
+      applyFlag(*flagExpr);
   return flags;
 }
 
@@ -766,7 +761,8 @@ filterFilesByTimeRange(std::vector<std::filesystem::path>&& files, ParseFlags co
   if(!flags.timestamp_min && !flags.timestamp_max)
     return std::move(files);
   std::vector<std::optional<FileTimeRange>> ranges(files.size());
-  parallelFor(files.size(), [&](size_t, size_t i) { ranges[i] = readFileTimeRange(files[i], flags); });
+  parallelFor(files.size(),
+              [&](size_t, size_t i) { ranges[i] = readFileTimeRange(files[i], flags); });
   std::vector<std::filesystem::path> filtered;
   filtered.reserve(files.size());
   for(size_t i = 0; i < files.size(); ++i) {
@@ -820,8 +816,16 @@ static bool isUnicodeSpace(char32_t cp) {
   switch(cp) {
   case 0x00A0: // no-break space
   case 0x1680: // ogham space mark
-  case 0x2000: case 0x2001: case 0x2002: case 0x2003: case 0x2004:
-  case 0x2005: case 0x2006: case 0x2007: case 0x2008: case 0x2009:
+  case 0x2000:
+  case 0x2001:
+  case 0x2002:
+  case 0x2003:
+  case 0x2004:
+  case 0x2005:
+  case 0x2006:
+  case 0x2007:
+  case 0x2008:
+  case 0x2009:
   case 0x200A: // en/em/thin/hair spaces
   case 0x202F: // narrow no-break space
   case 0x205F: // medium mathematical space
@@ -835,10 +839,15 @@ static bool isUnicodeSpace(char32_t cp) {
 // Code points that render as a hyphen/dash but are not ASCII '-'.
 static bool isUnicodeDash(char32_t cp) {
   switch(cp) {
-  case 0x2010: case 0x2011: case 0x2012: case 0x2013: case 0x2014:
+  case 0x2010:
+  case 0x2011:
+  case 0x2012:
+  case 0x2013:
+  case 0x2014:
   case 0x2015: // hyphen .. horizontal bar
   case 0x2212: // minus sign
-  case 0xFE58: case 0xFE63: // small em/hyphen-minus
+  case 0xFE58:
+  case 0xFE63: // small em/hyphen-minus
   case 0xFF0D: // fullwidth hyphen-minus
     return true;
   default:
@@ -955,6 +964,54 @@ static std::optional<Expression> correctLoadFilename(ExpressionArguments& dynami
   return "DidYouMean"_("Load"_(std::move(dynamics)));
 }
 
+// Messages missing from the profile are decoded with the name "unknown", so no other name
+// outside the profile can match a message.
+static bool isKnownMesgType(std::string const& name) {
+  return name == "unknown" || fit::Profile::GetMesg(name) != nullptr;
+}
+
+static size_t getEditDistance(std::string_view a, std::string_view b) {
+  std::vector<size_t> row(b.size() + 1);
+  std::iota(row.begin(), row.end(), size_t {0});
+  for(size_t i = 1; i <= a.size(); ++i) {
+    size_t diagonal = row[0];
+    row[0] = i;
+    for(size_t j = 1; j <= b.size(); ++j) {
+      size_t const above = row[j];
+      row[j] = std::min({above + 1, row[j - 1] + 1, diagonal + (a[i - 1] != b[j - 1])});
+      diagonal = above;
+    }
+  }
+  return row[b.size()];
+}
+
+static std::string const& findClosestMesgName(std::string_view name) {
+  auto const mesgs = std::span(fit::Profile::mesgs, fit::Profile::MESGS);
+  return std::ranges::min_element(
+             mesgs, {},
+             [name](fit::Profile::MESG const& mesg) { return getEditDistance(name, mesg.name); })
+      ->name;
+}
+
+// A failed Load in the format BOSS uses for failed evaluations: the Load expression, followed
+// by the reason as an expression. A reason the caller can fix is followed by a corrected Load
+// in a DidYouMean.
+static Expression reportLoadError(ExpressionArguments&& loadArgs, Expression&& reason) {
+  return "ErrorWhenEvaluatingExpression"_("Load"_(std::move(loadArgs)), std::move(reason));
+}
+
+static Expression reportUnknownMesgType(ExpressionArguments&& loadArgs) {
+  auto mesgType = std::get<Symbol>(loadArgs.at(1));
+  ExpressionArguments correctedArgs;
+  for(auto const& argument : loadArgs)
+    correctedArgs.push_back(
+        argument.clone(boss::expressions::CloneReason::EXPRESSION_SUBSTITUTION));
+  correctedArgs[1] = Symbol(findClosestMesgName(mesgType.getName()));
+  return "ErrorWhenEvaluatingExpression"_("Load"_(std::move(loadArgs)),
+                                          "UnknownMessageType"_(std::move(mesgType)),
+                                          "DidYouMean"_("Load"_(std::move(correctedArgs))));
+}
+
 static Expression evaluate(Expression&& e) {
   using sentinel::Any_;
   using sentinel::AnySequence_;
@@ -964,12 +1021,17 @@ static Expression evaluate(Expression&& e) {
                                                                        auto) -> Expression {
            if(auto suggestion = correctLoadFilename(dynamics))
              return std::move(*suggestion);
-           auto const& path = std::get<std::string>(dynamics.at(0));
+           auto const* pathArg = std::get_if<std::string>(&dynamics.at(0));
+           if(!pathArg)
+             return "Load"_(std::move(dynamics));
+           auto const& path = *pathArg;
            auto plan = planLoad(path);
            if(plan.fitFiles.empty())
              return "Load"_(std::move(dynamics));
 
            auto const& msgType = std::get<Symbol>(dynamics.at(1)).getName();
+           if(!isKnownMesgType(msgType))
+             return reportUnknownMesgType(std::move(dynamics));
            auto flags = parseFlagsFrom(dynamics, 2);
            auto filePaths = std::move(plan.fitFiles);
            filePaths = filterFilesByTimeRange(std::move(filePaths), flags);
@@ -1098,14 +1160,14 @@ static Expression evaluate(Expression&& e) {
              l.setTarget(msgType);
              l.flags = flags;
            }
-           std::vector<std::optional<std::string>> fileErrors(filePaths.size());
+           std::vector<std::optional<Expression>> fileErrors(filePaths.size());
            parallelFor(filePaths.size(), [&](size_t worker, size_t i) {
              fileErrors[i] = decodeFile(filePaths[i], listeners[worker], flags, mesgFilter);
            });
 
            for(auto& e : fileErrors)
              if(e)
-               return *e;
+               return reportLoadError(std::move(dynamics), std::move(*e));
 
            std::vector<HrPoint> hrPoints;
            if(flags.merge_heart_rates) {
@@ -1137,7 +1199,7 @@ static Expression evaluate(Expression&& e) {
                  return wrapForMixedDirectory(std::string(path), std::move(emptyTable));
                return std::move(emptyTable);
              }
-             return "Load::error: message type not found: "s + std::string(msgType);
+             return reportLoadError(std::move(dynamics), "NoMessagesOfType"_(Symbol(msgType)));
            }
 
            // Merge heart rate data: nearest-neighbour interpolation by timestamp. Rows with a
@@ -1163,7 +1225,10 @@ static Expression evaluate(Expression&& e) {
                                                                    auto) -> Expression {
            if(auto suggestion = correctLoadFilename(dynamics))
              return std::move(*suggestion);
-           auto const& path = std::get<std::string>(dynamics.at(0));
+           auto const* pathArg = std::get_if<std::string>(&dynamics.at(0));
+           if(!pathArg)
+             return "Load"_(std::move(dynamics));
+           auto const& path = *pathArg;
            auto plan = planLoad(path);
            if(plan.fitFiles.empty())
              return "Load"_(std::move(dynamics));
@@ -1230,7 +1295,7 @@ static Expression evaluate(Expression&& e) {
 
            // Decode in parallel into per-file slots; the first error is reported in file order.
            std::vector<SummaryListener> summaries(filePaths.size());
-           std::vector<std::optional<std::string>> errors(filePaths.size());
+           std::vector<std::optional<Expression>> errors(filePaths.size());
            parallelFor(filePaths.size(), [&](size_t, size_t i) {
              summaries[i].flags = flags;
              errors[i] = decodeFile(filePaths[i], summaries[i], flags, summaryMesgFilter());
@@ -1238,7 +1303,7 @@ static Expression evaluate(Expression&& e) {
 
            for(size_t i = 0; i < filePaths.size(); ++i) {
              if(errors[i])
-               return std::move(*errors[i]);
+               return reportLoadError(std::move(dynamics), std::move(*errors[i]));
              auto const& filePath = filePaths[i];
              auto const& summaryListener = summaries[i];
 
@@ -1273,9 +1338,15 @@ Message types (Garmin FIT protocol spec columns):
 
 **Path conventions:** Paths must be absolute. `~` is not expanded (BOSS does not invoke shell expansion). Use `/Users/<name>/...` on macOS, `/home/<name>/...` on Linux.
 
-             **Unicode in filenames:** Raw UTF-8 and JSON `\uXXXX` escapes are both accepted and equivalent - use whichever your client emits naturally. The real hazard is *invisible* Unicode: filenames produced by Apple devices commonly contain U+00A0 (non-breaking space) where a regular space appears to be - for instance, between "Apple" and "Watch" in Apple Watch export filenames. NBSP renders identically to a regular space everywhere, including in the `file` column returned by the directory-summary query, so it cannot be detected by sight. If `Load` reports `cannot open file` on a path that *visually* matches the directory listing, write the suspect gaps explicitly as `\u00a0` and retry. The same caution applies to U+200B (zero-width space), U+00AD (soft hyphen), and the Unicode dash variants. Discover the row with `(Slice (OrderBy (Load ".../dir") (List (Desc time_created))) 0 1)`.
+             **Unicode in filenames:** Raw UTF-8 and JSON `\uXXXX` escapes are both accepted and equivalent - use whichever your client emits naturally. The real hazard is *invisible* Unicode: filenames produced by Apple devices commonly contain U+00A0 (non-breaking space) where a regular space appears to be - for instance, between "Apple" and "Watch" in Apple Watch export filenames. NBSP renders identically to a regular space everywhere, including in the `file` column returned by the directory-summary query, so it cannot be detected by sight. If `Load` reports `FileNotOpened` for a path that *visually* matches the directory listing, write the suspect gaps explicitly as `\u00a0` and retry. The same caution applies to U+200B (zero-width space), U+00AD (soft hyphen), and the Unicode dash variants. Discover the row with `(Slice (OrderBy (Load ".../dir") (List (Desc time_created))) 0 1)`.
 
 **Auto-correction:** When `Load` is given a single file path that does not exist but whose name matches a file on disk *after* collapsing these look-alike code points (Unicode spaces \u2192 space, Unicode dashes \u2192 `-`, zero-width characters dropped), the engine does not error. Instead it returns the same query with the on-disk filename substituted, wrapped as `(DidYouMean (Load "/corrected/path.fit" ...))`. This is a suggestion, not a result: re-issue the inner `Load` to actually read the file.
+
+**Errors:** A failed `Load` returns `(ErrorWhenEvaluatingExpression (Load ...) reason)`, the format BOSS uses for failed evaluations. The reason is one of:
+- `(FileNotOpened "/path/file.fit")` - the file could not be opened
+- `(FileNotDecoded "/path/file.fit" "message")` - the FIT SDK rejected the file (corrupt, truncated or failing its CRC check); a directory load fails on the first such file
+- `(NoMessagesOfType msgtype)` - no loaded file contains a message of that type
+- `(UnknownMessageType msgtype)` - the FIT profile has no message of that name; the error then carries a third argument, `(DidYouMean (Load ... closest_msgtype ...))`, with the closest profile name substituted. Re-issue the inner `Load` to accept the suggestion.
 
 **Key patterns:**
 ```
