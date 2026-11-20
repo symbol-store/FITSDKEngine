@@ -15,6 +15,7 @@
 #include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <optional>
@@ -925,9 +926,24 @@ static std::string canonicaliseFilename(std::string const& s) {
   return out;
 }
 
-// If `requested` does not exist but a sibling entry canonicalises to the same
-// name, return that sibling's path — the filename the caller almost certainly
-// meant. Returns nullopt when the path already exists or no match is found.
+static size_t getEditDistance(std::string_view a, std::string_view b) {
+  std::vector<size_t> row(b.size() + 1);
+  std::iota(row.begin(), row.end(), size_t {0});
+  for(size_t i = 1; i <= a.size(); ++i) {
+    size_t diagonal = row[0];
+    row[0] = i;
+    for(size_t j = 1; j <= b.size(); ++j) {
+      size_t const above = row[j];
+      row[j] = std::min({above + 1, row[j - 1] + 1, diagonal + (a[i - 1] != b[j - 1])});
+      diagonal = above;
+    }
+  }
+  return row[b.size()];
+}
+
+// If `requested` does not exist, return the sibling whose canonicalised name is closest to
+// the canonicalised requested name by edit distance: the filename the caller most likely
+// meant. Returns nullopt when the path exists or its directory has no visible entries.
 static std::optional<std::filesystem::path>
 findFilenameCorrection(std::filesystem::path const& requested) {
   std::error_code ec;
@@ -938,19 +954,27 @@ findFilenameCorrection(std::filesystem::path const& requested) {
     parent = std::filesystem::path(".");
   if(!std::filesystem::is_directory(parent, ec))
     return std::nullopt;
-  auto target = canonicaliseFilename(requested.filename().string());
+  auto const target = canonicaliseFilename(requested.filename().string());
   if(target.empty())
     return std::nullopt;
+  std::optional<std::filesystem::path> closest;
+  size_t closestDistance = std::numeric_limits<size_t>::max();
   for(auto const& entry : std::filesystem::directory_iterator(parent, ec)) {
-    if(canonicaliseFilename(entry.path().filename().string()) == target)
-      return entry.path();
+    auto const name = entry.path().filename().string();
+    auto const distance = name.starts_with('.')
+                              ? std::numeric_limits<size_t>::max()
+                              : getEditDistance(canonicaliseFilename(name), target);
+    if(distance < closestDistance) {
+      closest = entry.path();
+      closestDistance = distance;
+    }
   }
-  return std::nullopt;
+  return closest;
 }
 
 // Build (DidYouMean (Load <corrected> <rest...>)) if the load's path argument
-// names a missing file with a canonical match on disk. The returned expression
-// is a suggestion: it is *not* evaluated, leaving the caller to confirm.
+// names a missing file in an existing directory. The returned expression is a
+// suggestion: it is *not* evaluated, leaving the caller to confirm.
 static std::optional<Expression> correctLoadFilename(ExpressionArguments& dynamics) {
   if(dynamics.empty())
     return std::nullopt;
@@ -968,21 +992,6 @@ static std::optional<Expression> correctLoadFilename(ExpressionArguments& dynami
 // outside the profile can match a message.
 static bool isKnownMesgType(std::string const& name) {
   return name == "unknown" || fit::Profile::GetMesg(name) != nullptr;
-}
-
-static size_t getEditDistance(std::string_view a, std::string_view b) {
-  std::vector<size_t> row(b.size() + 1);
-  std::iota(row.begin(), row.end(), size_t {0});
-  for(size_t i = 1; i <= a.size(); ++i) {
-    size_t diagonal = row[0];
-    row[0] = i;
-    for(size_t j = 1; j <= b.size(); ++j) {
-      size_t const above = row[j];
-      row[j] = std::min({above + 1, row[j - 1] + 1, diagonal + (a[i - 1] != b[j - 1])});
-      diagonal = above;
-    }
-  }
-  return row[b.size()];
 }
 
 static std::string const& findClosestMesgName(std::string_view name) {
@@ -1340,7 +1349,7 @@ Message types (Garmin FIT protocol spec columns):
 
              **Unicode in filenames:** Raw UTF-8 and JSON `\uXXXX` escapes are both accepted and equivalent - use whichever your client emits naturally. The real hazard is *invisible* Unicode: filenames produced by Apple devices commonly contain U+00A0 (non-breaking space) where a regular space appears to be - for instance, between "Apple" and "Watch" in Apple Watch export filenames. NBSP renders identically to a regular space everywhere, including in the `file` column returned by the directory-summary query, so it cannot be detected by sight. If `Load` reports `FileNotOpened` for a path that *visually* matches the directory listing, write the suspect gaps explicitly as `\u00a0` and retry. The same caution applies to U+200B (zero-width space), U+00AD (soft hyphen), and the Unicode dash variants. Discover the row with `(Slice (OrderBy (Load ".../dir") (List (Desc time_created))) 0 1)`.
 
-**Auto-correction:** When `Load` is given a single file path that does not exist but whose name matches a file on disk *after* collapsing these look-alike code points (Unicode spaces \u2192 space, Unicode dashes \u2192 `-`, zero-width characters dropped), the engine does not error. Instead it returns the same query with the on-disk filename substituted, wrapped as `(DidYouMean (Load "/corrected/path.fit" ...))`. This is a suggestion, not a result: re-issue the inner `Load` to actually read the file.
+**Auto-correction:** When `Load` is given a single file path that does not exist in an existing directory, the engine does not error. It collapses look-alike code points in the requested name and in the names on disk (Unicode spaces \u2192 space, Unicode dashes \u2192 `-`, zero-width characters dropped), picks the on-disk file whose name is closest to the requested one by edit distance, and returns the same query with that filename substituted, wrapped as `(DidYouMean (Load "/corrected/path.fit" ...))`. This is a suggestion, not a result: check the name, then re-issue the inner `Load` to actually read the file.
 
 **Errors:** A failed `Load` returns `(ErrorWhenEvaluatingExpression (Load ...) reason)`, the format BOSS uses for failed evaluations. The reason is one of:
 - `(FileNotOpened "/path/file.fit")` - the file could not be opened
